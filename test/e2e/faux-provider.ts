@@ -11,7 +11,7 @@ export const FAUX_PROVIDER = "faux";
 export const FAUX_MODEL = "faux-model";
 
 function textOf(message: Message | undefined): string {
-	if (!message || message.role !== "user") return "";
+	if (message?.role !== "user") return "";
 	if (typeof message.content === "string") return message.content;
 	return message.content
 		.filter((block): block is { type: "text"; text: string } => block.type === "text")
