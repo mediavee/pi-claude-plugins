@@ -47,6 +47,12 @@ function reply(context: Context) {
 	if (prompt.includes("read the env file")) {
 		return fauxAssistantMessage([fauxToolCall("bash", { command: "cat .env" })]);
 	}
+	if (prompt.includes("check the git log")) {
+		return fauxAssistantMessage([fauxToolCall("bash", { command: "git log --oneline -1" })]);
+	}
+	if (prompt.includes("list the files")) {
+		return fauxAssistantMessage([fauxToolCall("bash", { command: "ls -1" })]);
+	}
 	if (prompt.includes("run the echo agent")) {
 		return fauxAssistantMessage([
 			fauxToolCall("claude_plugin_agent", { agent: "demo-plugin:echo", task: "ping" }),

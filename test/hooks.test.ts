@@ -113,6 +113,7 @@ describe("discoverHooks", () => {
 		expect(result.hooks.map((entry) => entry.event).sort()).toEqual([
 			"PostToolUse",
 			"PreToolUse",
+			"PreToolUse",
 			"SessionStart",
 		]);
 		expect(result.unsupported).toContain("event Notification");

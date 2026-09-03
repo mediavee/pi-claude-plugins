@@ -50,6 +50,27 @@ describe("pi --mode rpc with the demo plugin", () => {
 		expect(JSON.stringify(results[0]?.result)).toContain("reading .env is not allowed by demo-plugin");
 	});
 
+	it("turns a hook's ask into a real confirmation and honours a refusal", async () => {
+		session.autoAnswerConfirm(false);
+		await session.prompt("check the git log");
+
+		const results = session.toolResults("bash").filter((event) => event.isError);
+		const refused = results.find((event) =>
+			JSON.stringify(event.result).includes("demo-plugin wants a human to confirm"),
+		);
+		expect(refused).toBeDefined();
+		expect(session.events.some((event) => event.type === "extension_ui_request")).toBe(true);
+	});
+
+	it("does not fire an if-filtered hook on a command it does not name", async () => {
+		session.autoAnswerConfirm(false);
+		const before = session.events.length;
+		await session.prompt("list the files");
+
+		const asked = session.events.slice(before).some((event) => event.type === "extension_ui_request");
+		expect(asked).toBe(false);
+	});
+
 	it("runs a plugin agent in a child pi process", async () => {
 		await session.prompt("run the echo agent", 90_000);
 		const results = session.toolResults("claude_plugin_agent");

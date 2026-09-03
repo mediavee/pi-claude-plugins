@@ -48,14 +48,14 @@ describe("loadPlugins", () => {
 			settings: settings({ paths: [FIXTURE_PLUGIN], trustedPlugins: ["demo-plugin"] }),
 			...loadOptions,
 		});
-		expect(trusted.plugins[0]?.hooks).toHaveLength(3);
+		expect(trusted.plugins[0]?.hooks).toHaveLength(4);
 		expect(trusted.plugins[0]?.trusted).toBe(true);
 
 		const global = loadPlugins({
 			settings: settings({ paths: [FIXTURE_PLUGIN], allowHooks: true }),
 			...loadOptions,
 		});
-		expect(global.plugins[0]?.hooks).toHaveLength(3);
+		expect(global.plugins[0]?.hooks).toHaveLength(4);
 	});
 
 	it("maps Claude agent tool names onto pi's", () => {

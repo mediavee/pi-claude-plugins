@@ -31,6 +31,7 @@ project, which is read only once the project is trusted):
   "claudePlugins": {
     "paths": ["~/plugins/acme-tools"],
     "marketplaces": ["~/marketplaces/acme"],
+    "enabledPlugins": ["formatter@acme"],
     "allowHooks": false,
     "allowShellCommands": false,
     "trustedPlugins": [],
@@ -44,11 +45,17 @@ project, which is read only once the project is trusted):
 | --- | --- | --- |
 | `paths` | `[]` | Plugin directories. Relative paths resolve against the settings file's directory |
 | `marketplaces` | `[]` | Marketplace checkouts containing `.claude-plugin/marketplace.json` |
+| `enabledPlugins` | `[]` | Marketplace entries to load, as `name@marketplace` |
 | `allowHooks` | `false` | Run hooks from every plugin |
 | `allowShellCommands` | `false` | Run `` !`command` `` expansions in plugin commands |
 | `trustedPlugins` | `[]` | Grant both of the above to named plugins only |
 | `disabledPlugins` | `[]` | Skip these plugins entirely |
 | `agents` | `true` | Register the subagent tool for plugin agents |
+
+A plugin's identity is origin-qualified: a directory from `paths` is known by its manifest name,
+and a marketplace entry by `name@marketplace`. `enabledPlugins`, `trustedPlugins` and
+`disabledPlugins` all match that identity, so one marketplace cannot inherit another plugin's
+grants by reusing its name.
 
 For headless and container use, the environment wins over settings:
 
@@ -56,6 +63,7 @@ For headless and container use, the environment wins over settings:
 | --- | --- |
 | `PI_CLAUDE_PLUGINS` | `PATH`-separated plugin directories, appended to `paths` |
 | `PI_CLAUDE_PLUGINS_MARKETPLACES` | `PATH`-separated marketplace directories |
+| `PI_CLAUDE_PLUGINS_ENABLED` | Comma-separated marketplace entries to enable |
 | `PI_CLAUDE_PLUGINS_ALLOW_HOOKS` | `1`/`true` enables hooks |
 | `PI_CLAUDE_PLUGINS_ALLOW_SHELL` | `1`/`true` enables `!` expansion |
 
@@ -81,7 +89,12 @@ refused.
 
 Plugin skill directories are handed to pi as they are, so relative links, bundled scripts and
 assets keep working. pi implements the same Agent Skills standard and exposes each skill as
-`/skill:<name>`.
+`/skill:<name>`. A `SKILL.md` at the plugin root loads only when the plugin ships no `skills/`
+directory and declares no manifest `skills` field, as upstream.
+
+pi does not understand `${CLAUDE_*}` placeholders. A skill whose body uses one is served from a
+mirror directory where the siblings are symlinked and only `SKILL.md` is rewritten, so bundled
+script paths resolve while relative links keep working.
 
 Claude Code namespaces plugin skills as `/plugin:skill`. pi skill names are limited to
 `[a-z0-9-]`, so the colon form cannot be reproduced and skills keep their own names. If two
@@ -95,14 +108,26 @@ Command bodies get the full Claude Code treatment:
 - `$ARGUMENTS`, `$ARGUMENTS[N]` and `$N` — **zero-based**, so `$0` is the first argument, matching
   Claude Code rather than pi's one-based prompt templates.
 - `$name` for arguments declared in the `arguments` frontmatter key.
-- `` !`command` `` and ` ```! ` blocks, gated behind `allowShellCommands`.
+- `` !`command` `` and ` ```! ` blocks, gated behind `allowShellCommands` or `trustedPlugins`.
 - `@path` file references.
 - `${CLAUDE_PLUGIN_ROOT}`, `${CLAUDE_PLUGIN_DATA}`, `${CLAUDE_PROJECT_DIR}`, `${CLAUDE_SESSION_ID}`.
 
 When no placeholder consumes the arguments, they are appended as `ARGUMENTS: <value>`, as upstream.
 
-`@path` differs on one point: Claude Code attaches the referenced file, while pi has no attachment
-channel for extension-sent messages, so the contents are inlined in a labelled code fence.
+Shell commands and `@path` references are read from the authored command file **before** any
+argument is substituted, and every placeholder is resolved in a single pass. Text an argument
+brings in is therefore never rescanned, so an argument cannot smuggle in a command to run or a
+file to read.
+
+Two deliberate restrictions:
+
+- Only `${CLAUDE_*}` placeholders expand in command prose. Generic `${VAR}` expansion is
+  confined to MCP configuration, as upstream, so a command body cannot copy an environment
+  secret into the prompt.
+- `@path` reads are confined to the project directory and the plugin directory. Claude Code
+  subjects them to its Read permission rules, which pi has no equivalent of; a reference outside
+  both is replaced with a marker. The contents are inlined in a labelled code fence rather than
+  attached, because pi has no attachment channel for extension-sent messages.
 
 ### Agents
 
@@ -114,35 +139,64 @@ tool names map onto pi's:
 `Glob`→`find`, `Grep`→`grep`, `LS`→`ls`.
 
 Names with no pi equivalent, such as `Task` or `WebFetch`, are dropped and reported rather than
-passed through, since an unknown name would fail the child process. The `hooks`, `mcpServers` and
-`permissionMode` frontmatter keys are refused for plugin agents, as they are upstream.
+passed through, since an unknown name would fail the child process. `disallowedTools` is
+subtracted from the allowlist, or from pi's built-in tools when the agent declares none.
+
+An agent is **not loaded** when it declares a restriction pi cannot honour, rather than running
+with more freedom than its author asked for. That covers `isolation`, `maxTurns`, `memory`,
+`skills` and `background`, and an agent whose entire `tools` list maps to nothing. `hooks`,
+`mcpServers` and `permissionMode` are refused for plugin agents, as they are upstream. `effort`
+maps onto pi's thinking level where the names coincide. Everything refused is named at startup.
 
 ### Hooks
 
 | Claude event | pi event | What a hook can do |
 | --- | --- | --- |
-| `PreToolUse` | `tool_call` | Deny the call, or rewrite its input with `updatedInput` |
-| `PostToolUse` | `tool_result` | Append feedback or `additionalContext` to the result |
-| `UserPromptSubmit` | `input` | Block the prompt, or inject `additionalContext` |
+| `PreToolUse` | `tool_call` | Allow, ask, deny, or rewrite the input with `updatedInput` |
+| `PostToolUse` | `tool_result` | Append feedback, or replace the output with `updatedToolOutput` |
+| `UserPromptSubmit` | `input` | Block the prompt, or inject context |
 | `Stop` | `agent_end` | Block to keep the conversation going, capped at 8 continuations |
-| `SessionStart` | `session_start` | Inject `additionalContext` for the first turn |
+| `SessionStart` | `session_start` | Inject context for the first turn |
 | `PreCompact` | `session_before_compact` | Block compaction |
 
 Handlers receive Claude Code's JSON on stdin, with `tool_name` in Claude's vocabulary so matchers
 written upstream keep firing, and with `CLAUDE_PLUGIN_ROOT`, `CLAUDE_PLUGIN_DATA` and
 `CLAUDE_PROJECT_DIR` in their environment. Exit codes and JSON output follow the upstream
-protocol: exit `2` blocks with stderr as the reason, valid JSON on stdout is honoured on any exit
-code, any other non-zero exit is a non-blocking error. `permissionDecision: "ask"` allows the call
-with a warning, because pi's `tool_call` has no "prompt the user" outcome.
+protocol: exit `2` blocks with stderr as the reason whatever the hook also printed, valid JSON on
+stdout is honoured on any exit code, and any other non-zero exit is a non-blocking error. When
+several hooks match they all run in parallel and their decisions merge with `deny` > `ask` >
+`allow`.
+
+Decisions fail closed:
+
+- `permissionDecision: "ask"` shows a confirmation. With no UI — `pi --mode json`, `pi -p` —
+  there is nobody to ask, so the call is denied.
+- `permissionDecision: "defer"` is denied. It exists to suspend a `claude -p` run for later
+  resumption, which pi cannot do; treating it as an allow would turn a pause into an approval.
+- `continue: false` stops the run. On `Stop` it ends the turn rather than continuing it.
+
+`UserPromptSubmit` and `SessionStart` also take plain stdout as context, as upstream; on every
+other event stdout is diagnostic only.
+
+A handler's `if` rule is evaluated on `PreToolUse` and `PostToolUse`: `Bash(git *)` checks the
+command, its `$(…)` and backtick substitutions and its `&&`/`;`/`|` chain with leading `VAR=`
+assignments stripped, while `Edit(**/src/**)` checks the path. As upstream the filter is
+best-effort and runs the hook when the command is opaque. A handler that declares `if` on any
+other event never runs. `shell: "bash" | "powershell"` selects the interpreter.
 
 Matchers use Claude's rules: a matcher of only word characters, spaces, commas and pipes is a list
 of exact names, anything else is an unanchored regular expression.
 
-`tool_input` is translated where the shapes differ, so `Read`, `Write`, `Edit` and `LS` report
-`file_path` rather than pi's `path`, and an `updatedInput` coming back is translated in reverse.
-Beyond the path, `Edit` keeps pi's `edits[]` array instead of Claude's `old_string`/`new_string`,
-so a hook that rewrites edit contents needs pi's shape. A call a `PreToolUse` hook denied never
-fires `PostToolUse`, as upstream.
+`tool_input` is translated where the shapes differ, so `Read`, `Write`, `Edit` and `LS` report an
+**absolute** `file_path` rather than pi's possibly relative `path`, matching Claude Code's
+guarantee that a path policy cannot be dodged by spelling the same file relatively. An
+`updatedInput` coming back is translated in reverse. Beyond the path, `Edit` keeps pi's `edits[]`
+array instead of Claude's `old_string`/`new_string`, so a hook that rewrites edit contents needs
+pi's shape.
+
+`PostToolUse` fires only for a call that ran and succeeded, as upstream: a call a `PreToolUse`
+hook denied, and a call that failed, are both skipped. `tool_response` carries pi's structured
+`details` where the tool provides them, and the rendered content otherwise.
 
 ### MCP servers
 
@@ -155,11 +209,16 @@ Without `pi-mcp-adapter` installed, the servers are skipped and named in the sta
 
 ### Marketplaces
 
-`marketplaces` entries are read from a local checkout. Plugin entries with a relative `./path`
-source (or a bare name under `metadata.pluginRoot`) load; `github`, `url`, `git-subdir`, `npm`,
-`archive` and `command` sources are reported as unresolved rather than fetched. Cloning and
-caching remote sources duplicates what `pi install git:…` already does, so point `marketplaces` at
-a checkout you manage.
+A marketplace is a catalog, not an install: adding one lists what is available, and an entry only
+loads once `enabledPlugins` names it. The startup report lists everything available but not
+enabled.
+
+Entries are read from a local checkout. A relative `./path` source (or a bare name under
+`metadata.pluginRoot`) resolves; any source containing `..` is rejected outright, as upstream,
+even when it normalises back inside. `github`, `url`, `git-subdir`, `npm`, `archive` and
+`command` sources are reported as unresolved rather than fetched: cloning and caching remote
+sources duplicates what `pi install git:…` already does, so point `marketplaces` at a checkout
+you manage.
 
 ## Not supported
 
@@ -173,6 +232,8 @@ a checkout you manage.
 | `userConfig` and `${user_config.*}` | Needs a settings UI and a credential store |
 | `http`, `mcp_tool`, `prompt` and `agent` hook handlers | Only `command` handlers are executed; the rest are reported |
 | Hook events outside the six above | No pi counterpart; each one is named in the startup report |
+| `PostToolUseFailure` | pi has no separate failure event, so failed calls simply skip `PostToolUse` |
+| Marketplace `defaultEnabled` and `strict` | Enablement is explicit through `enabledPlugins` |
 
 Everything refused or unsupported is listed at startup, never silently ignored.
 
@@ -192,7 +253,8 @@ Enable per plugin with `trustedPlugins`, or globally with `allowHooks` / `allowS
 context instead of failing.
 
 Component paths that resolve outside the plugin directory, symlinks included, are rejected. Only
-that component is dropped; the plugin still loads.
+that component is dropped; the plugin still loads, and a malformed plugin never stops the ones
+behind it from loading.
 
 ## Development
 

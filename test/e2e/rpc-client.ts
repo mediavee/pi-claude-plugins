@@ -28,6 +28,7 @@ export class RpcSession {
 	readonly stderr: string[] = [];
 	private buffer = "";
 	private waiters: Array<() => void> = [];
+	private confirmAnswer: boolean | undefined;
 
 	private constructor(child: ChildProcessWithoutNullStreams, agentDir: string, workDir: string) {
 		this.child = child;
@@ -84,7 +85,9 @@ export class RpcSession {
 			this.buffer = this.buffer.slice(newline + 1);
 			if (line.trim()) {
 				try {
-					this.events.push(JSON.parse(line) as RpcEvent);
+					const event = JSON.parse(line) as RpcEvent;
+					this.events.push(event);
+					this.answerDialog(event);
 				} catch {
 					// Non-protocol noise on stdout is not ours to interpret.
 				}
@@ -96,6 +99,11 @@ export class RpcSession {
 
 	send(command: Record<string, unknown>): void {
 		this.child.stdin.write(`${JSON.stringify(command)}\n`);
+	}
+
+	/** Answers every extension confirm dialog with `confirmed`, as a client would. */
+	autoAnswerConfirm(confirmed: boolean): void {
+		this.confirmAnswer = confirmed;
 	}
 
 	async waitFor(
@@ -118,6 +126,12 @@ export class RpcSession {
 				});
 			});
 		}
+	}
+
+	private answerDialog(event: RpcEvent): void {
+		if (event.type !== "extension_ui_request" || event.method !== "confirm") return;
+		if (this.confirmAnswer === undefined) return;
+		this.send({ type: "extension_ui_response", id: event.id, confirmed: this.confirmAnswer });
 	}
 
 	/** Runs one prompt and resolves once the agent has settled. */

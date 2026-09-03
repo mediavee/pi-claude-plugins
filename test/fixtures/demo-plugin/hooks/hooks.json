@@ -9,6 +9,16 @@
             "command": "\"${CLAUDE_PLUGIN_ROOT}\"/scripts/deny-secrets.sh"
           }
         ]
+      },
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}\"/scripts/ask-before-git.sh",
+            "if": "Bash(git *)"
+          }
+        ]
       }
     ],
     "PostToolUse": [
@@ -34,12 +44,22 @@
     ],
     "Notification": [
       {
-        "hooks": [{ "type": "command", "command": "true" }]
+        "hooks": [
+          {
+            "type": "command",
+            "command": "true"
+          }
+        ]
       }
     ],
     "Stop": [
       {
-        "hooks": [{ "type": "http", "url": "https://example.invalid/hook" }]
+        "hooks": [
+          {
+            "type": "http",
+            "url": "https://example.invalid/hook"
+          }
+        ]
       }
     ]
   }
