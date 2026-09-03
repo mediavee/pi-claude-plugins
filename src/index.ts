@@ -1,4 +1,5 @@
 import { spawn } from "node:child_process";
+import { mkdirSync } from "node:fs";
 import { resolve } from "node:path";
 import { type ExtensionAPI, type ExtensionContext, getAgentDir } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
@@ -35,6 +36,8 @@ interface State {
 	pendingContext: string[];
 	stopContinuations: number;
 	registeredCommands: Set<string>;
+	/** Calls a PreToolUse hook denied, so PostToolUse hooks skip them as they do upstream. */
+	blockedCalls: Set<string>;
 }
 
 function emptyState(): State {
@@ -49,6 +52,7 @@ function emptyState(): State {
 		pendingContext: [],
 		stopContinuations: 0,
 		registeredCommands: new Set(),
+		blockedCalls: new Set(),
 	};
 }
 
@@ -59,6 +63,7 @@ export default function claudePlugins(pi: ExtensionAPI): void {
 		state.registrations = [];
 		state.pendingContext = [];
 		state.stopContinuations = 0;
+		state.blockedCalls.clear();
 
 		const agentDir = getAgentDir();
 		const settings = resolveSettings({
@@ -153,6 +158,7 @@ export default function claudePlugins(pi: ExtensionAPI): void {
 			await pi.sendMessage({ customType: MESSAGE_TYPE, content: context, display: false });
 		}
 		if (decision.blocked) {
+			state.blockedCalls.add(event.toolCallId);
 			return {
 				block: true,
 				reason: decision.reason ?? "blocked by a plugin hook",
@@ -162,6 +168,7 @@ export default function claudePlugins(pi: ExtensionAPI): void {
 	});
 
 	pi.on("tool_result", async (event, ctx) => {
+		if (state.blockedCalls.delete(event.toolCallId)) return;
 		const claudeName = piToolToClaude(event.toolName);
 		const hooks = hooksFor(state.hooks, "PostToolUse", claudeName);
 		if (hooks.length === 0) return;
@@ -261,12 +268,23 @@ async function runHooks(
 				input,
 				cwd: ctx.cwd,
 				projectDir: ctx.cwd,
-				dataDir: resolve(state.dataRoot, hook.plugin.replace(/[^\w-]+/g, "-")),
+				dataDir: dataDirFor(state, hook.plugin),
 				...(ctx.signal ? { signal: ctx.signal } : {}),
 			}),
 		),
 	);
 	return mergeDecisions(executions);
+}
+
+/** `${CLAUDE_PLUGIN_DATA}` is created on first reference upstream, so hooks can rely on it. */
+function dataDirFor(state: State, plugin: string): string {
+	const dir = resolve(state.dataRoot, plugin.replace(/[^\w-]+/g, "-"));
+	try {
+		mkdirSync(dir, { recursive: true });
+	} catch {
+		// A hook that needs the directory will report the failure itself.
+	}
+	return dir;
 }
 
 function report(ctx: ExtensionContext, decision: HookDecision): void {
@@ -301,7 +319,7 @@ function registerCommands(pi: ExtensionAPI, state: State, sessionCtx: ExtensionC
 
 			const vars: SubstitutionVars = {
 				CLAUDE_PLUGIN_ROOT: plugin.root,
-				CLAUDE_PLUGIN_DATA: resolve(state.dataRoot, plugin.name.replace(/[^\w-]+/g, "-")),
+				CLAUDE_PLUGIN_DATA: dataDirFor(state, plugin.name),
 				CLAUDE_PROJECT_DIR: sessionCtx.cwd,
 			};
 

@@ -184,8 +184,13 @@ Claude Code fire in pi. `tool_input` is translated per tool where the shapes dif
 Claude's `Read` takes `file_path`. Translation is bidirectional: an `updatedInput` coming back
 from a hook is mapped to pi's shape before being written onto `event.input`.
 
-`PostToolUse` adds `tool_response` and `duration_ms`; `UserPromptSubmit` adds `prompt`;
-`SessionStart` adds `source`; `PreCompact` adds `trigger` and `custom_instructions`.
+`PostToolUse` adds `tool_response`; `UserPromptSubmit` adds `prompt`; `SessionStart` adds
+`source`; `PreCompact` adds `trigger` and `custom_instructions`. Beyond the path rename, `Edit`
+keeps pi's `edits[]` array rather than Claude's `old_string`/`new_string`: the two edit models are
+not equivalent, and inventing a lossy translation would silently corrupt an `updatedInput`.
+
+A call denied by a `PreToolUse` hook never reaches `PostToolUse`, matching upstream, where that
+event only fires for a tool that ran.
 
 **Matchers** are regular expressions tested with `RegExp.prototype.test` (unanchored), plus the
 exact-match set form (`Write|Edit`, or a comma-separated list). `"*"` and an absent matcher both

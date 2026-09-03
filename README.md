@@ -138,6 +138,12 @@ with a warning, because pi's `tool_call` has no "prompt the user" outcome.
 Matchers use Claude's rules: a matcher of only word characters, spaces, commas and pipes is a list
 of exact names, anything else is an unanchored regular expression.
 
+`tool_input` is translated where the shapes differ, so `Read`, `Write`, `Edit` and `LS` report
+`file_path` rather than pi's `path`, and an `updatedInput` coming back is translated in reverse.
+Beyond the path, `Edit` keeps pi's `edits[]` array instead of Claude's `old_string`/`new_string`,
+so a hook that rewrites edit contents needs pi's shape. A call a `PreToolUse` hook denied never
+fires `PostToolUse`, as upstream.
+
 ### MCP servers
 
 Servers from `.mcp.json` are registered with `pi-mcp-adapter` at `session_start` and disposed at
