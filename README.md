@@ -237,6 +237,15 @@ you manage.
 
 Everything refused or unsupported is listed at startup, never silently ignored.
 
+Three smaller deviations worth knowing:
+
+- `${CLAUDE_*}` placeholders are substituted before arguments, so an argument containing one
+  reaches the model literally rather than being expanded.
+- There is no escape syntax for a literal `$0` or `$ARGUMENTS` in a command body.
+- `Stop` hook input carries `last_assistant_message` but not `background_tasks` or
+  `session_crons`; pi has no task registry to populate them from, and both arrays are optional
+  upstream.
+
 ## Security
 
 Every plugin component runs with your privileges. Two of them are code you never typed:

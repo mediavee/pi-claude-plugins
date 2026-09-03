@@ -2,7 +2,7 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { agentInvocationArgs, discoverAgents, resolveAgent } from "../src/agents.ts";
+import { agentInvocationArgs, discoverAgents, resolveAgent, runAgent } from "../src/agents.ts";
 import type { PluginAgent, SubstitutionVars } from "../src/types.ts";
 
 const vars: SubstitutionVars = {
@@ -120,6 +120,22 @@ describe("agentInvocationArgs", () => {
 		const args = agentInvocationArgs(agent({ thinkingLevel: "high" }), undefined);
 		expect(args[args.indexOf("--thinking") + 1]).toBe("high");
 	});
+});
+
+describe("runAgent cancellation", () => {
+	it("does not wait forever for a child that ignores SIGTERM", async () => {
+		const controller = new AbortController();
+		const started = Date.now();
+		const pending = runAgent({
+			agent: agent({ systemPrompt: "" }),
+			task: "loop",
+			cwd: process.cwd(),
+			signal: controller.signal,
+		});
+		setTimeout(() => controller.abort(), 100);
+		await pending;
+		expect(Date.now() - started).toBeLessThan(15_000);
+	}, 20_000);
 });
 
 describe("resolveAgent", () => {

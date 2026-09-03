@@ -16,6 +16,9 @@ const RESTRICTING_FRONTMATTER = ["isolation", "maxTurns", "memory", "skills", "b
 
 const THINKING_LEVELS = new Set(["low", "medium", "high", "xhigh", "max"]);
 
+const KILL_GRACE_MS = 2_000;
+const MAX_OUTPUT_BYTES = 1_000_000;
+
 export interface AgentDiscovery {
 	agents: PluginAgent[];
 	escaped: string[];
@@ -216,14 +219,32 @@ function spawnPi(args: string[], options: RunAgentOptions): Promise<RunAgentResu
 		const child = spawn(invocation.command, invocation.args, {
 			cwd: options.cwd,
 			shell: false,
+			detached: process.platform !== "win32",
 			stdio: ["ignore", "pipe", "pipe"],
 		});
 
 		const texts: string[] = [];
 		let stderr = "";
 		let buffer = "";
+		let killScheduled = false;
 
-		const onAbort = () => child.kill("SIGTERM");
+		const signalGroup = (signal: NodeJS.Signals) => {
+			if (child.pid === undefined) return;
+			try {
+				if (process.platform === "win32") child.kill(signal);
+				else process.kill(-child.pid, signal);
+			} catch {
+				// The process group is already gone.
+			}
+		};
+
+		// A child that ignores SIGTERM would otherwise keep the tool call pending forever.
+		const onAbort = () => {
+			signalGroup("SIGTERM");
+			if (killScheduled) return;
+			killScheduled = true;
+			setTimeout(() => signalGroup("SIGKILL"), KILL_GRACE_MS).unref();
+		};
 		options.signal?.addEventListener("abort", onAbort, { once: true });
 
 		child.stdout.setEncoding("utf8");
@@ -243,7 +264,7 @@ function spawnPi(args: string[], options: RunAgentOptions): Promise<RunAgentResu
 		});
 		child.stderr.setEncoding("utf8");
 		child.stderr.on("data", (chunk: string) => {
-			stderr += chunk;
+			if (stderr.length < MAX_OUTPUT_BYTES) stderr += chunk;
 		});
 
 		const finish = (exitCode: number) => {
