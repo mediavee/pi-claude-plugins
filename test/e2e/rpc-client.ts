@@ -1,0 +1,157 @@
+import { type ChildProcessWithoutNullStreams, spawn } from "node:child_process";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join, resolve } from "node:path";
+import { REPO_ROOT } from "../helpers.ts";
+import { FAUX_MODEL, FAUX_PROVIDER } from "./faux-provider.ts";
+
+export interface RpcEvent {
+	type: string;
+	[key: string]: unknown;
+}
+
+export interface StartOptions {
+	pluginPaths: string[];
+	allowHooks?: boolean;
+	allowShell?: boolean;
+}
+
+/**
+ * Drives a real `pi --mode rpc` process over JSONL. The faux provider is installed through
+ * `PI_CODING_AGENT_DIR` rather than `-e` so that the `pi` child an agent spawns loads it too.
+ */
+export class RpcSession {
+	private readonly child: ChildProcessWithoutNullStreams;
+	private readonly agentDir: string;
+	readonly workDir: string;
+	readonly events: RpcEvent[] = [];
+	readonly stderr: string[] = [];
+	private buffer = "";
+	private waiters: Array<() => void> = [];
+
+	private constructor(child: ChildProcessWithoutNullStreams, agentDir: string, workDir: string) {
+		this.child = child;
+		this.agentDir = agentDir;
+		this.workDir = workDir;
+
+		child.stdout.setEncoding("utf8");
+		child.stdout.on("data", (chunk: string) => this.consume(chunk));
+		child.stderr.setEncoding("utf8");
+		child.stderr.on("data", (chunk: string) => this.stderr.push(chunk));
+	}
+
+	static start(options: StartOptions): RpcSession {
+		const agentDir = mkdtempSync(join(tmpdir(), "pcp-agent-"));
+		const workDir = mkdtempSync(join(tmpdir(), "pcp-work-"));
+		writeFileSync(
+			join(agentDir, "settings.json"),
+			JSON.stringify({
+				defaultProvider: FAUX_PROVIDER,
+				defaultModel: FAUX_MODEL,
+				quietStartup: true,
+				defaultProjectTrust: "never",
+				extensions: [resolve(REPO_ROOT, "test/e2e/faux-provider.ts")],
+			}),
+		);
+
+		const child = spawn(
+			resolve(REPO_ROOT, "node_modules/.bin/pi"),
+			["--mode", "rpc", "--no-session", "-e", resolve(REPO_ROOT, "src/index.ts")],
+			{
+				cwd: workDir,
+				stdio: ["pipe", "pipe", "pipe"],
+				env: {
+					...process.env,
+					PI_CODING_AGENT_DIR: agentDir,
+					PI_OFFLINE: "1",
+					PI_SKIP_VERSION_CHECK: "1",
+					PI_CLAUDE_PLUGINS: options.pluginPaths.join(":"),
+					PI_CLAUDE_PLUGINS_ALLOW_HOOKS: options.allowHooks ? "1" : "0",
+					PI_CLAUDE_PLUGINS_ALLOW_SHELL: options.allowShell ? "1" : "0",
+				},
+			},
+		) as ChildProcessWithoutNullStreams;
+
+		return new RpcSession(child, agentDir, workDir);
+	}
+
+	// RPC mode is strict JSONL on LF; Node's readline would also split on U+2028/U+2029.
+	private consume(chunk: string): void {
+		this.buffer += chunk;
+		let newline = this.buffer.indexOf("\n");
+		while (newline !== -1) {
+			const line = this.buffer.slice(0, newline).replace(/\r$/, "");
+			this.buffer = this.buffer.slice(newline + 1);
+			if (line.trim()) {
+				try {
+					this.events.push(JSON.parse(line) as RpcEvent);
+				} catch {
+					// Non-protocol noise on stdout is not ours to interpret.
+				}
+			}
+			newline = this.buffer.indexOf("\n");
+		}
+		for (const waiter of this.waiters.splice(0)) waiter();
+	}
+
+	send(command: Record<string, unknown>): void {
+		this.child.stdin.write(`${JSON.stringify(command)}\n`);
+	}
+
+	async waitFor(
+		predicate: (event: RpcEvent) => boolean,
+		options: { from?: number; timeoutMs?: number } = {},
+	): Promise<RpcEvent> {
+		const from = options.from ?? 0;
+		const deadline = Date.now() + (options.timeoutMs ?? 25_000);
+		for (;;) {
+			const found = this.events.slice(from).find(predicate);
+			if (found) return found;
+			if (Date.now() > deadline) {
+				throw new Error(`timed out waiting for an event\nstderr:\n${this.stderr.join("")}`);
+			}
+			await new Promise<void>((resolvePromise) => {
+				const timer = setTimeout(resolvePromise, 50);
+				this.waiters.push(() => {
+					clearTimeout(timer);
+					resolvePromise();
+				});
+			});
+		}
+	}
+
+	/** Runs one prompt and resolves once the agent has settled. */
+	async prompt(message: string, timeoutMs?: number): Promise<void> {
+		const from = this.events.length;
+		this.send({ type: "prompt", message });
+		await this.waitFor((event) => event.type === "agent_settled", {
+			from,
+			...(timeoutMs === undefined ? {} : { timeoutMs }),
+		});
+	}
+
+	assistantTexts(): string[] {
+		return this.events
+			.filter((event) => event.type === "message_end")
+			.map((event) => event.message as { role?: string; content?: Array<{ type?: string; text?: string }> })
+			.filter((message) => message?.role === "assistant")
+			.flatMap((message) => message.content ?? [])
+			.filter((block) => block.type === "text" && typeof block.text === "string")
+			.map((block) => block.text as string);
+	}
+
+	toolResults(toolName: string): RpcEvent[] {
+		return this.events.filter((event) => event.type === "tool_execution_end" && event.toolName === toolName);
+	}
+
+	async stop(): Promise<void> {
+		this.child.stdin.end();
+		this.child.kill("SIGTERM");
+		await new Promise<void>((resolvePromise) => {
+			this.child.on("close", () => resolvePromise());
+			setTimeout(resolvePromise, 2000);
+		});
+		rmSync(this.agentDir, { recursive: true, force: true });
+		rmSync(this.workDir, { recursive: true, force: true });
+	}
+}
