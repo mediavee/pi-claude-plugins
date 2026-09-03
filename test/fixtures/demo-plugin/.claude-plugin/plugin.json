@@ -1,0 +1,7 @@
+{
+  "name": "demo-plugin",
+  "version": "1.0.0",
+  "description": "Fixture plugin exercising every component pi-claude-plugins supports",
+  "author": { "name": "pi-claude-plugins" },
+  "license": "MIT"
+}

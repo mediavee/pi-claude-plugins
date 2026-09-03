@@ -38,7 +38,7 @@ export function pluginNameFor(root: string, manifest: PluginManifest): string {
  */
 export function isInsidePlugin(root: string, candidate: string): boolean {
 	const realRoot = safeRealpath(resolve(root));
-	const realCandidate = safeRealpath(resolve(root, candidate));
+	const realCandidate = safeRealpath(resolve(realRoot, candidate));
 	if (realRoot === realCandidate) return true;
 	const rel = relative(realRoot, realCandidate);
 	return rel !== "" && !rel.startsWith("..") && !isAbsolute(rel);

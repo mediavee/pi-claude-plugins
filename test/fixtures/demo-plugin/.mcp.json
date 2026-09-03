@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "docs": {
+      "command": "${CLAUDE_PLUGIN_ROOT}/scripts/mcp-server.sh",
+      "args": ["--root", "${CLAUDE_PLUGIN_ROOT}"],
+      "env": { "DEMO_DATA": "${CLAUDE_PLUGIN_DATA}", "DEMO_TOKEN": "${DEMO_TOKEN:-anonymous}" }
+    }
+  }
+}

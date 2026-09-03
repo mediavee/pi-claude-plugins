@@ -1,0 +1,21 @@
+{
+  "name": "demo-marketplace",
+  "owner": { "name": "pi-claude-plugins" },
+  "plugins": [
+    {
+      "name": "tiny",
+      "source": "./plugins/tiny",
+      "description": "Single-skill plugin resolved through a relative marketplace source"
+    },
+    {
+      "name": "remote",
+      "source": { "source": "github", "repo": "example/remote-plugin" },
+      "description": "Remote source this loader reports instead of fetching"
+    },
+    {
+      "name": "escaping",
+      "source": "./../outside",
+      "description": "Source outside the marketplace root"
+    }
+  ]
+}

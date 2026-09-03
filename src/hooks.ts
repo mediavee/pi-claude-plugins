@@ -189,6 +189,8 @@ export function runHook(options: RunHookOptions): Promise<HookExecution> {
 		const child = spawn(command, hook.handler.args ?? [], {
 			cwd: options.cwd,
 			shell: useShell,
+			// Own process group so a timeout kills the shell's children too, not just the shell.
+			detached: process.platform !== "win32",
 			stdio: ["pipe", "pipe", "pipe"],
 			env: {
 				...(options.env ?? process.env),
@@ -201,13 +203,25 @@ export function runHook(options: RunHookOptions): Promise<HookExecution> {
 		let stdout = "";
 		let stderr = "";
 		let timedOut = false;
+		let settled = false;
+
+		const terminate = () => {
+			if (child.pid === undefined) return;
+			try {
+				if (process.platform === "win32") child.kill("SIGTERM");
+				else process.kill(-child.pid, "SIGTERM");
+			} catch {
+				// The process group is already gone.
+			}
+		};
 
 		const timer = setTimeout(() => {
 			timedOut = true;
-			child.kill("SIGTERM");
+			terminate();
+			finish(1);
 		}, timeoutFor(hook));
 
-		const onAbort = () => child.kill("SIGTERM");
+		const onAbort = () => terminate();
 		options.signal?.addEventListener("abort", onAbort, { once: true });
 
 		child.stdout.setEncoding("utf8");
@@ -219,7 +233,9 @@ export function runHook(options: RunHookOptions): Promise<HookExecution> {
 			stderr += chunk;
 		});
 
-		const finish = (exitCode: number) => {
+		function finish(exitCode: number): void {
+			if (settled) return;
+			settled = true;
 			clearTimeout(timer);
 			options.signal?.removeEventListener("abort", onAbort);
 			resolvePromise({
@@ -230,7 +246,7 @@ export function runHook(options: RunHookOptions): Promise<HookExecution> {
 				timedOut,
 				...(timedOut ? {} : withJson(stdout)),
 			});
-		};
+		}
 
 		child.on("error", (error) => {
 			stderr += `${stderr ? "\n" : ""}${error.message}`;
