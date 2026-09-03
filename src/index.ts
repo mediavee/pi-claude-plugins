@@ -121,7 +121,7 @@ export default function claudePlugins(pi: ExtensionAPI): void {
 			...baseInput(ctx, "UserPromptSubmit"),
 			prompt: event.text,
 		});
-		report(ctx, decision);
+		notifyWarnings(ctx, decision);
 		if (decision.blocked) {
 			ctx.ui.notify(decision.reason ?? "prompt blocked by a plugin hook", "warning");
 			return { action: "handled" as const };
@@ -149,7 +149,7 @@ export default function claudePlugins(pi: ExtensionAPI): void {
 			tool_input: piInputToClaude(event.toolName, input),
 			tool_use_id: event.toolCallId,
 		});
-		report(ctx, decision);
+		notifyWarnings(ctx, decision);
 
 		if (decision.updatedInput) {
 			replaceInput(input, claudeInputToPi(event.toolName, decision.updatedInput));
@@ -180,7 +180,7 @@ export default function claudePlugins(pi: ExtensionAPI): void {
 			tool_response: event.content,
 			tool_use_id: event.toolCallId,
 		});
-		report(ctx, decision);
+		notifyWarnings(ctx, decision);
 
 		const extra = [...decision.additionalContext];
 		if (decision.blocked && decision.reason) extra.push(decision.reason);
@@ -197,7 +197,7 @@ export default function claudePlugins(pi: ExtensionAPI): void {
 			...baseInput(ctx, "Stop"),
 			stop_hook_active: active,
 		});
-		report(ctx, decision);
+		notifyWarnings(ctx, decision);
 
 		// Claude Code's Stop block continues the conversation with the reason handed to the model.
 		if (decision.blocked && state.stopContinuations < MAX_STOP_CONTINUATIONS) {
@@ -225,7 +225,7 @@ export default function claudePlugins(pi: ExtensionAPI): void {
 			trigger,
 			custom_instructions: event.customInstructions ?? null,
 		});
-		report(ctx, decision);
+		notifyWarnings(ctx, decision);
 		if (decision.blocked) {
 			ctx.ui.notify(decision.reason ?? "compaction blocked by a plugin hook", "warning");
 			return { cancel: true };
@@ -287,7 +287,7 @@ function dataDirFor(state: State, plugin: string): string {
 	return dir;
 }
 
-function report(ctx: ExtensionContext, decision: HookDecision): void {
+function notifyWarnings(ctx: ExtensionContext, decision: HookDecision): void {
 	for (const warning of decision.warnings) ctx.ui.notify(warning, "warning");
 }
 
@@ -302,7 +302,7 @@ async function runSessionStartHooks(
 	if (hooks.length === 0) return;
 
 	const decision = await runHooks(state, ctx, hooks, { ...baseInput(ctx, "SessionStart"), source });
-	report(ctx, decision);
+	notifyWarnings(ctx, decision);
 	if (decision.additionalContext.length === 0) return;
 	await pi.sendMessage(
 		{ customType: MESSAGE_TYPE, content: decision.additionalContext.join("\n\n"), display: false },
