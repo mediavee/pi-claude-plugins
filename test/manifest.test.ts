@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
-	isInsidePlugin,
+	isInside,
 	ManifestError,
 	pluginNameFor,
 	readManifest,
@@ -43,21 +43,40 @@ describe("plugin roots", () => {
 		expect(() => readManifest(root)).toThrow(ManifestError);
 	});
 
+	it("rejects a component path field that is not a string or array", () => {
+		for (const manifest of ['{"commands":42}', '{"agents":{"a":1}}', '{"skills":[1]}']) {
+			writeFileSync(join(root, ".claude-plugin/plugin.json"), manifest);
+			expect(() => readManifest(root)).toThrow(ManifestError);
+		}
+	});
+
+	it("accepts hooks and mcpServers as a path, a list or an inline object", () => {
+		for (const manifest of [
+			'{"hooks":"./h.json"}',
+			'{"hooks":["./h.json"]}',
+			'{"hooks":{"PreToolUse":[]}}',
+			'{"mcpServers":{"docs":{}}}',
+		]) {
+			writeFileSync(join(root, ".claude-plugin/plugin.json"), manifest);
+			expect(() => readManifest(root)).not.toThrow();
+		}
+	});
+
 	it("falls back to the directory name when the manifest omits one", () => {
 		expect(pluginNameFor(root, {})).toBe(root.split("/").pop());
 	});
 
 	it("refuses a path that leaves the plugin directory", () => {
-		expect(isInsidePlugin(root, "./skills")).toBe(true);
-		expect(isInsidePlugin(root, "../elsewhere")).toBe(false);
-		expect(isInsidePlugin(root, "/etc")).toBe(false);
+		expect(isInside(root, "./skills")).toBe(true);
+		expect(isInside(root, "../elsewhere")).toBe(false);
+		expect(isInside(root, "/etc")).toBe(false);
 	});
 
 	it("refuses a symlink whose target resolves outside the plugin", () => {
 		const outside = mkdtempSync(join(tmpdir(), "pcp-outside-"));
 		try {
 			symlinkSync(outside, join(root, "escape"));
-			expect(isInsidePlugin(root, "escape")).toBe(false);
+			expect(isInside(root, "escape")).toBe(false);
 		} finally {
 			rmSync(outside, { recursive: true, force: true });
 		}
@@ -105,7 +124,9 @@ describe("readMarketplace", () => {
 		expect(marketplace.plugins.map((plugin) => plugin.name)).toEqual(["tiny"]);
 
 		const unresolved = Object.fromEntries(marketplace.unresolved.map((entry) => [entry.name, entry.reason]));
-		expect(unresolved.remote).toContain("not a local path");
-		expect(unresolved.escaping).toContain("escapes the marketplace directory");
+		expect(unresolved.remote).toContain("not a usable local path");
+		// Claude Code rejects any source containing "..", even one that normalises back inside.
+		expect(unresolved.escaping).toContain("not a usable local path");
+		expect(unresolved.traversing).toContain("not a usable local path");
 	});
 });

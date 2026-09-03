@@ -24,6 +24,25 @@ describe("discoverMcpServers", () => {
 		expect(result.warnings.join(" ")).toContain("API_BASE");
 	});
 
+	it("accepts an inline server map that is not wrapped in mcpServers", () => {
+		const manifest = { mcpServers: { docs: { command: "/bin/true" } } };
+		const result = discoverMcpServers("demo-plugin", FIXTURE_PLUGIN, manifest, vars, {});
+		expect(result.servers.map((entry) => entry.name)).toEqual(["demo-plugin__docs"]);
+	});
+
+	it("accepts an inline server map that keeps the file wrapper", () => {
+		const manifest = { mcpServers: { mcpServers: { docs: { command: "/bin/true" } } } };
+		const result = discoverMcpServers("demo-plugin", FIXTURE_PLUGIN, manifest, vars, {});
+		expect(result.servers.map((entry) => entry.name)).toEqual(["demo-plugin__docs"]);
+	});
+
+	it("reports a config file it cannot parse instead of treating it as empty", () => {
+		const manifest = { mcpServers: "./hooks/broken.json" };
+		const result = discoverMcpServers("demo-plugin", FIXTURE_PLUGIN, manifest, vars, {});
+		expect(result.servers).toEqual([]);
+		expect(result.warnings.join(" ")).toContain("was ignored");
+	});
+
 	it("reads .mcp.json when the manifest declares nothing", () => {
 		const result = discoverMcpServers("demo-plugin", FIXTURE_PLUGIN, readManifest(FIXTURE_PLUGIN), vars, {});
 		expect(result.servers.map((entry) => entry.name)).toEqual(["demo-plugin__docs"]);

@@ -1,6 +1,8 @@
 {
   "name": "demo-marketplace",
-  "owner": { "name": "pi-claude-plugins" },
+  "owner": {
+    "name": "pi-claude-plugins"
+  },
   "plugins": [
     {
       "name": "tiny",
@@ -9,13 +11,21 @@
     },
     {
       "name": "remote",
-      "source": { "source": "github", "repo": "example/remote-plugin" },
+      "source": {
+        "source": "github",
+        "repo": "example/remote-plugin"
+      },
       "description": "Remote source this loader reports instead of fetching"
     },
     {
       "name": "escaping",
       "source": "./../outside",
       "description": "Source outside the marketplace root"
+    },
+    {
+      "name": "traversing",
+      "source": "./plugins/../plugins/tiny",
+      "description": "Source that normalises back inside but still contains .."
     }
   ]
 }

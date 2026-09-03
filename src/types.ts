@@ -17,8 +17,8 @@ export interface PluginManifest {
 	skills?: string | string[];
 	commands?: string | string[];
 	agents?: string | string[];
-	hooks?: string | string[] | HooksConfig;
-	mcpServers?: string | string[] | McpConfig;
+	hooks?: string | string[] | HooksConfig | HookEventMap;
+	mcpServers?: string | string[] | McpConfig | McpServerMap;
 }
 
 export interface Diagnostic {
@@ -100,6 +100,8 @@ export interface HookMatcherGroup {
 	hooks: HookHandler[];
 }
 
+export type HookEventMap = Partial<Record<string, HookMatcherGroup[] | undefined>>;
+
 export interface HooksConfig {
 	hooks?: Partial<Record<string, HookMatcherGroup[] | undefined>>;
 }
@@ -122,6 +124,8 @@ export interface McpServerEntry {
 	type?: string;
 	[key: string]: unknown;
 }
+
+export type McpServerMap = Record<string, McpServerEntry | undefined>;
 
 export interface McpConfig {
 	mcpServers?: Record<string, McpServerEntry | undefined>;

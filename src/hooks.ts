@@ -155,7 +155,13 @@ export function matches(matcher: string | undefined, value: string): boolean {
 
 const IF_RULE = /^([A-Za-z_][\w-]*)\(([\s\S]*)\)$/;
 
-function globToRegExp(pattern: string): RegExp {
+/**
+ * `crossesSeparator` distinguishes the two rule flavours: in a command rule `*` stands for the
+ * rest of the command line, while in a path rule a single `*` stops at a directory boundary.
+ */
+function globToRegExp(pattern: string, crossesSeparator: boolean): RegExp {
+	const single = crossesSeparator ? ".*" : "[^/]*";
+	const singleChar = crossesSeparator ? "." : "[^/]";
 	let source = "";
 	for (let index = 0; index < pattern.length; index += 1) {
 		const char = pattern[index] ?? "";
@@ -166,11 +172,11 @@ function globToRegExp(pattern: string): RegExp {
 				if (pattern[index + 1] === "/") index += 1;
 				continue;
 			}
-			source += "[^/]*";
+			source += single;
 			continue;
 		}
 		if (char === "?") {
-			source += "[^/]";
+			source += singleChar;
 			continue;
 		}
 		source += char.replace(/[.+^${}()|[\]\\]/g, "\\$&");
@@ -212,13 +218,13 @@ export function matchesIf(
 		const command = input.command;
 		if (typeof command !== "string") return true;
 		if (/\$\w|\$\{/.test(command) && pattern.trim().split(/\s+/).length > 1) return true;
-		const test = globToRegExp(pattern);
+		const test = globToRegExp(pattern, true);
 		return bashSubcommands(command).some((part) => test.test(part));
 	}
 
 	const path = input.file_path ?? input.path;
 	if (typeof path !== "string") return true;
-	return globToRegExp(pattern).test(path);
+	return globToRegExp(pattern, false).test(path);
 }
 
 export interface HookInput {
@@ -307,7 +313,7 @@ export function runHook(options: RunHookOptions): Promise<HookExecution> {
 		let stderr = "";
 		let timedOut = false;
 		let settled = false;
-		let killTimer: NodeJS.Timeout | undefined;
+		let killScheduled = false;
 
 		const signalGroup = (signal: NodeJS.Signals) => {
 			if (child.pid === undefined) return;
@@ -322,7 +328,9 @@ export function runHook(options: RunHookOptions): Promise<HookExecution> {
 		// A handler that ignores SIGTERM would otherwise keep privileged descendants alive.
 		const terminate = () => {
 			signalGroup("SIGTERM");
-			killTimer ??= setTimeout(() => signalGroup("SIGKILL"), KILL_GRACE_MS).unref();
+			if (killScheduled) return;
+			killScheduled = true;
+			setTimeout(() => signalGroup("SIGKILL"), KILL_GRACE_MS).unref();
 		};
 
 		const timer = setTimeout(() => {

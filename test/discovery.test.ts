@@ -17,6 +17,7 @@ function settings(overrides: Partial<PluginSettings> = {}): PluginSettings {
 		allowHooks: false,
 		trustedPlugins: [],
 		disabledPlugins: [],
+		enabledPlugins: [],
 		agents: true,
 		...overrides,
 	};
@@ -30,7 +31,7 @@ describe("loadPlugins", () => {
 		expect(result.plugins).toHaveLength(1);
 
 		const plugin = result.plugins[0];
-		expect(plugin?.name).toBe("demo-plugin");
+		expect(plugin?.id).toBe("demo-plugin");
 		expect(plugin?.skills.map((skill) => skill.name)).toEqual(["demo-greeting"]);
 		expect(plugin?.commands.map((command) => command.name).sort()).toEqual(["review", "status"]);
 		expect(plugin?.agents.map((agent) => agent.name)).toEqual(["echo"]);
@@ -40,6 +41,7 @@ describe("loadPlugins", () => {
 	it("refuses hooks until the plugin is trusted", () => {
 		const untrusted = loadPlugins({ settings: settings({ paths: [FIXTURE_PLUGIN] }), ...loadOptions });
 		expect(untrusted.plugins[0]?.hooks).toEqual([]);
+		expect(untrusted.plugins[0]?.trusted).toBe(false);
 		expect(untrusted.plugins[0]?.refused.join(" ")).toContain("hook handler");
 
 		const trusted = loadPlugins({
@@ -47,6 +49,7 @@ describe("loadPlugins", () => {
 			...loadOptions,
 		});
 		expect(trusted.plugins[0]?.hooks).toHaveLength(3);
+		expect(trusted.plugins[0]?.trusted).toBe(true);
 
 		const global = loadPlugins({
 			settings: settings({ paths: [FIXTURE_PLUGIN], allowHooks: true }),
@@ -56,10 +59,7 @@ describe("loadPlugins", () => {
 	});
 
 	it("maps Claude agent tool names onto pi's", () => {
-		const result = loadPlugins({
-			settings: settings({ paths: [FIXTURE_PLUGIN] }),
-			...loadOptions,
-		});
+		const result = loadPlugins({ settings: settings({ paths: [FIXTURE_PLUGIN] }), ...loadOptions });
 		expect(result.plugins[0]?.agents[0]?.tools).toEqual(["read", "grep"]);
 	});
 
@@ -87,34 +87,82 @@ describe("loadPlugins", () => {
 		expect(result.plugins).toEqual([]);
 	});
 
-	it("loads a plugin through a marketplace and reports unresolved sources", () => {
+	it("reports a plugin path that does not exist", () => {
+		const result = loadPlugins({ settings: settings({ paths: ["/nope/plugin"] }), ...loadOptions });
+		expect(result.plugins).toEqual([]);
+		expect(result.diagnostics[0]?.level).toBe("error");
+	});
+
+	it("keeps loading after a malformed plugin", () => {
+		const broken = mkdtempSync(join(tmpdir(), "pcp-broken-"));
+		try {
+			mkdirSync(join(broken, ".claude-plugin"), { recursive: true });
+			writeFileSync(
+				join(broken, ".claude-plugin/plugin.json"),
+				JSON.stringify({ name: "broken", commands: 42 }),
+			);
+			const result = loadPlugins({
+				settings: settings({ paths: [broken, FIXTURE_PLUGIN] }),
+				...loadOptions,
+			});
+			expect(result.plugins.map((plugin) => plugin.id)).toEqual(["demo-plugin"]);
+			expect(result.diagnostics.some((entry) => entry.level === "error")).toBe(true);
+		} finally {
+			rmSync(broken, { recursive: true, force: true });
+		}
+	});
+});
+
+describe("marketplace entries", () => {
+	it("lists catalog entries without loading them", () => {
 		const result = loadPlugins({
 			settings: settings({ marketplaces: [FIXTURE_MARKETPLACE] }),
 			...loadOptions,
 		});
-		expect(result.plugins.map((plugin) => plugin.name)).toEqual(["tiny"]);
-		expect(result.plugins[0]?.marketplace).toBe("demo-marketplace");
-
-		const messages = result.diagnostics.map((diagnostic) => diagnostic.message).join("\n");
-		expect(messages).toContain("not a local path");
+		expect(result.plugins).toEqual([]);
+		expect(result.available).toEqual(["tiny@demo-marketplace"]);
 	});
 
-	it("reports a plugin path that does not exist", () => {
+	it("loads an entry once it is enabled, with an origin-qualified id", () => {
 		const result = loadPlugins({
-			settings: settings({ paths: ["/nope/plugin"] }),
+			settings: settings({
+				marketplaces: [FIXTURE_MARKETPLACE],
+				enabledPlugins: ["tiny@demo-marketplace"],
+			}),
 			...loadOptions,
 		});
-		expect(result.plugins).toEqual([]);
-		expect(result.diagnostics[0]?.level).toBe("error");
+		expect(result.plugins.map((plugin) => plugin.id)).toEqual(["tiny@demo-marketplace"]);
+		expect(result.plugins[0]?.marketplace).toBe("demo-marketplace");
+	});
+
+	it("does not let a marketplace entry inherit a bare name's hook trust", () => {
+		const result = loadPlugins({
+			settings: settings({
+				marketplaces: [FIXTURE_MARKETPLACE],
+				enabledPlugins: ["tiny@demo-marketplace"],
+				trustedPlugins: ["tiny"],
+			}),
+			...loadOptions,
+		});
+		expect(result.plugins[0]?.trusted).toBe(false);
+	});
+
+	it("reports unresolved sources, including a traversing one", () => {
+		const result = loadPlugins({
+			settings: settings({ marketplaces: [FIXTURE_MARKETPLACE] }),
+			...loadOptions,
+		});
+		const messages = result.diagnostics.map((diagnostic) => diagnostic.message).join("\n");
+		expect(messages).toContain("not a usable local path");
 	});
 });
 
 describe("findSkillCollisions", () => {
 	it("names the plugins that share a skill name", () => {
 		const collisions = findSkillCollisions([
-			{ plugin: "a", path: "/a", name: "review" },
-			{ plugin: "b", path: "/b", name: "review" },
-			{ plugin: "a", path: "/c", name: "unique" },
+			{ plugin: "a", path: "/a", name: "review", needsSubstitution: false },
+			{ plugin: "b", path: "/b", name: "review", needsSubstitution: false },
+			{ plugin: "a", path: "/c", name: "unique", needsSubstitution: false },
 		]);
 		expect(collisions).toEqual([{ name: "review", plugins: ["a", "b"] }]);
 	});
@@ -128,7 +176,7 @@ describe("formatReport", () => {
 			diagnostics: result.diagnostics,
 			collisions: result.collisions,
 			mcpUnavailable: ["demo-plugin__docs"],
-			shellAllowed: false,
+			available: ["tiny@demo-marketplace"],
 		});
 
 		expect(report).toContain("loaded 1 plugin(s)");
@@ -136,6 +184,7 @@ describe("formatReport", () => {
 		expect(report).toContain("refused:");
 		expect(report).toContain("unsupported hook event Notification");
 		expect(report).toContain("shell expansion in commands is disabled");
+		expect(report).toContain("available but not enabled");
 		expect(report).toContain("pi-mcp-adapter");
 	});
 });
@@ -157,6 +206,7 @@ describe("resolveSettings", () => {
 		const resolved = resolveSettings({ cwd, agentDir, projectTrusted: true, env: {} });
 		expect(resolved).toMatchObject({ allowHooks: false, allowShellCommands: false, agents: true });
 		expect(resolved.paths).toEqual([]);
+		expect(resolved.enabledPlugins).toEqual([]);
 	});
 
 	it("resolves relative paths against the settings file directory", () => {
@@ -184,18 +234,20 @@ describe("resolveSettings", () => {
 		expect(trusted.paths).toEqual([join(cwd, ".pi/local")]);
 	});
 
-	it("appends plugin directories and flags from the environment", () => {
+	it("appends plugin directories, enabled entries and flags from the environment", () => {
 		const resolved = resolveSettings({
 			cwd,
 			agentDir,
 			projectTrusted: false,
 			env: {
 				PI_CLAUDE_PLUGINS: `${FIXTURE_PLUGIN}:/second`,
+				PI_CLAUDE_PLUGINS_ENABLED: "tiny@demo-marketplace,other",
 				PI_CLAUDE_PLUGINS_ALLOW_HOOKS: "1",
 				PI_CLAUDE_PLUGINS_ALLOW_SHELL: "true",
 			},
 		});
 		expect(resolved.paths).toEqual([FIXTURE_PLUGIN, "/second"]);
+		expect(resolved.enabledPlugins).toEqual(["tiny@demo-marketplace", "other"]);
 		expect(resolved.allowHooks).toBe(true);
 		expect(resolved.allowShellCommands).toBe(true);
 	});

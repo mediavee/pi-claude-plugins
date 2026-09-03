@@ -90,9 +90,32 @@ function parseAgent(
 		if (key in frontmatter) warnings.push(`agent ${name} declares "${key}", which plugins may not set`);
 	}
 
+	// A restriction pi cannot honour must not be silently dropped: the agent would then run
+	// with wider access than its author declared.
+	for (const key of RESTRICTING_FRONTMATTER) {
+		if (key in frontmatter) {
+			warnings.push(`agent ${name} declares "${key}", which pi cannot honour; the agent is not loaded`);
+			return { warnings };
+		}
+	}
+
 	const { tools, dropped } = mapClaudeToolList(toolList(frontmatter.tools));
 	if (dropped.length > 0) {
 		warnings.push(`agent ${name} requests tools with no pi equivalent: ${dropped.join(", ")}`);
+	}
+	if ("tools" in frontmatter && tools.length === 0) {
+		warnings.push(`agent ${name} restricts itself to tools pi does not provide; the agent is not loaded`);
+		return { warnings };
+	}
+
+	const disallowed = mapClaudeToolList(toolList(frontmatter.disallowedTools));
+	if (disallowed.dropped.length > 0) {
+		warnings.push(`agent ${name} disallows tools with no pi equivalent: ${disallowed.dropped.join(", ")}`);
+	}
+
+	const effort = typeof frontmatter.effort === "string" ? frontmatter.effort : undefined;
+	if (effort !== undefined && !THINKING_LEVELS.has(effort)) {
+		warnings.push(`agent ${name} requests effort "${effort}", which has no pi thinking level`);
 	}
 
 	const agent: PluginAgent = {
@@ -105,7 +128,9 @@ function parseAgent(
 				: `Agent from the ${plugin} plugin`,
 		systemPrompt: substituteClaudeVars(body, vars),
 		...(typeof frontmatter.model === "string" ? { model: frontmatter.model } : {}),
+		...(effort !== undefined && THINKING_LEVELS.has(effort) ? { thinkingLevel: effort } : {}),
 		...(tools.length > 0 ? { tools } : {}),
+		...(disallowed.tools.length > 0 ? { excludeTools: disallowed.tools } : {}),
 	};
 	return { agent, warnings };
 }
@@ -126,6 +151,25 @@ export interface RunAgentOptions {
 	onText?: (text: string) => void;
 }
 
+/**
+ * Without an explicit allowlist the child falls back to pi's full default tool set, which is
+ * wider than an author who wrote `disallowedTools` expects.
+ */
+export function agentInvocationArgs(agent: PluginAgent, fallbackModel: string | undefined): string[] {
+	const args = ["--mode", "json", "-p", "--no-session"];
+
+	const model = agent.model ?? fallbackModel;
+	if (model) args.push("--model", model);
+	if (agent.thinkingLevel) args.push("--thinking", agent.thinkingLevel);
+
+	const allowed = agent.tools ?? [...DEFAULT_PI_TOOLS];
+	const effective = allowed.filter((tool) => !agent.excludeTools?.includes(tool));
+	if (effective.length > 0) args.push("--tools", effective.join(","));
+	else args.push("--no-tools");
+
+	return args;
+}
+
 export interface RunAgentResult {
 	output: string;
 	exitCode: number;
@@ -138,17 +182,7 @@ export interface RunAgentResult {
  */
 export async function runAgent(options: RunAgentOptions): Promise<RunAgentResult> {
 	const { agent } = options;
-	const args = ["--mode", "json", "-p", "--no-session"];
-
-	const model = agent.model ?? options.fallbackModel;
-	if (model) args.push("--model", model);
-	if (agent.thinkingLevel) args.push("--thinking", agent.thinkingLevel);
-	// Without an explicit allowlist the child would fall back to pi's full default tool set,
-	// which is wider than a `disallowedTools` author expects.
-	const allowed = agent.tools ?? [...DEFAULT_PI_TOOLS];
-	const effective = allowed.filter((tool) => !agent.excludeTools?.includes(tool));
-	if (effective.length > 0) args.push("--tools", effective.join(","));
-	else args.push("--no-tools");
+	const args = agentInvocationArgs(agent, options.fallbackModel);
 
 	let promptDir: string | undefined;
 	try {
