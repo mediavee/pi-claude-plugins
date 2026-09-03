@@ -1,6 +1,6 @@
 import { existsSync, readFileSync } from "node:fs";
 import { resolve } from "node:path";
-import { isInsidePlugin } from "./manifest.ts";
+import { isInside } from "./manifest.ts";
 
 export const MARKETPLACE_PATH = ".claude-plugin/marketplace.json";
 
@@ -68,10 +68,13 @@ export function readMarketplace(root: string): ResolvedMarketplace {
 		if (!entry || typeof entry.name !== "string" || entry.name.length === 0) continue;
 		const relativePath = localSourcePath(entry.source, pluginRoot);
 		if (relativePath === undefined) {
-			unresolved.push({ name: entry.name, reason: `${describeSource(entry.source)} is not a local path` });
+			unresolved.push({
+				name: entry.name,
+				reason: `${describeSource(entry.source)} is not a usable local path`,
+			});
 			continue;
 		}
-		if (!isInsidePlugin(root, relativePath)) {
+		if (!isInside(root, relativePath)) {
 			unresolved.push({ name: entry.name, reason: "source escapes the marketplace directory" });
 			continue;
 		}
@@ -86,9 +89,15 @@ export function readMarketplace(root: string): ResolvedMarketplace {
 	return { name: manifest.name ?? root, root, plugins, unresolved };
 }
 
-/** A relative `./path`, or a bare name when `metadata.pluginRoot` gives it a home. */
+/**
+ * A relative `./path`, or a bare name when `metadata.pluginRoot` gives it a home.
+ *
+ * `..` is rejected outright rather than normalised, matching Claude Code's marketplace
+ * validation, which refuses any source containing it even when it resolves back inside.
+ */
 function localSourcePath(source: unknown, pluginRoot: string | undefined): string | undefined {
 	if (typeof source !== "string") return undefined;
+	if (source.split("/").includes("..")) return undefined;
 	if (source.startsWith("./")) return source;
 	if (!source.includes("/") && pluginRoot !== undefined) return `${pluginRoot.replace(/\/$/, "")}/${source}`;
 	return undefined;

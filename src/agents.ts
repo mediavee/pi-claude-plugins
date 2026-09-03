@@ -4,12 +4,17 @@ import { tmpdir } from "node:os";
 import { basename, extname, join } from "node:path";
 import { parseFrontmatter } from "@earendil-works/pi-coding-agent";
 import { isDirectory, resolveComponentPaths } from "./manifest.ts";
-import { substitute } from "./substitute.ts";
-import { mapClaudeToolList } from "./tool-names.ts";
+import { substituteClaudeVars } from "./substitute.ts";
+import { DEFAULT_PI_TOOLS, mapClaudeToolList } from "./tool-names.ts";
 import type { PluginAgent, PluginManifest, SubstitutionVars } from "./types.ts";
 
 /** Refused for plugin-shipped agents upstream, so refused here too. */
 const FORBIDDEN_FRONTMATTER = ["hooks", "mcpServers", "permissionMode"] as const;
+
+/** Fields that constrain an agent; ignoring one would run it with more freedom than declared. */
+const RESTRICTING_FRONTMATTER = ["isolation", "maxTurns", "memory", "skills", "background"] as const;
+
+const THINKING_LEVELS = new Set(["low", "medium", "high", "xhigh", "max"]);
 
 export interface AgentDiscovery {
 	agents: PluginAgent[];
@@ -23,19 +28,18 @@ export function discoverAgents(
 	manifest: PluginManifest,
 	vars: SubstitutionVars,
 ): AgentDiscovery {
-	const { paths, escaped } = resolveComponentPaths(root, manifest.agents, "agents", "replace");
+	const resolved = resolveComponentPaths(root, manifest.agents, "agents", "replace");
 	const agents: PluginAgent[] = [];
-	const warnings: string[] = [];
+	const warnings: string[] = [...resolved.invalid];
 
-	for (const path of paths) {
+	for (const path of resolved.paths) {
 		for (const file of markdownFiles(path)) {
 			const parsed = parseAgent(plugin, file, vars);
-			if (!parsed) continue;
-			agents.push(parsed.agent);
+			if (parsed.agent) agents.push(parsed.agent);
 			warnings.push(...parsed.warnings);
 		}
 	}
-	return { agents, escaped, warnings };
+	return { agents, escaped: resolved.escaped, warnings };
 }
 
 function markdownFiles(path: string): string[] {
@@ -54,12 +58,12 @@ function parseAgent(
 	plugin: string,
 	file: string,
 	vars: SubstitutionVars,
-): { agent: PluginAgent; warnings: string[] } | undefined {
+): { agent?: PluginAgent; warnings: string[] } {
 	let raw: string;
 	try {
 		raw = readFileSync(file, "utf8");
 	} catch {
-		return undefined;
+		return { warnings: [`agent ${basename(file)} could not be read`] };
 	}
 
 	const warnings: string[] = [];
@@ -99,7 +103,7 @@ function parseAgent(
 			typeof frontmatter.description === "string"
 				? frontmatter.description
 				: `Agent from the ${plugin} plugin`,
-		systemPrompt: substitute(body, vars),
+		systemPrompt: substituteClaudeVars(body, vars),
 		...(typeof frontmatter.model === "string" ? { model: frontmatter.model } : {}),
 		...(tools.length > 0 ? { tools } : {}),
 	};
@@ -138,7 +142,13 @@ export async function runAgent(options: RunAgentOptions): Promise<RunAgentResult
 
 	const model = agent.model ?? options.fallbackModel;
 	if (model) args.push("--model", model);
-	if (agent.tools && agent.tools.length > 0) args.push("--tools", agent.tools.join(","));
+	if (agent.thinkingLevel) args.push("--thinking", agent.thinkingLevel);
+	// Without an explicit allowlist the child would fall back to pi's full default tool set,
+	// which is wider than a `disallowedTools` author expects.
+	const allowed = agent.tools ?? [...DEFAULT_PI_TOOLS];
+	const effective = allowed.filter((tool) => !agent.excludeTools?.includes(tool));
+	if (effective.length > 0) args.push("--tools", effective.join(","));
+	else args.push("--no-tools");
 
 	let promptDir: string | undefined;
 	try {

@@ -7,7 +7,8 @@ export interface ReportInput {
 	collisions: readonly SkillCollision[];
 	/** Servers skipped because pi-mcp-adapter is not loaded. */
 	mcpUnavailable: readonly string[];
-	shellAllowed: boolean;
+	/** Marketplace entries present on disk that no `enabledPlugins` entry selects. */
+	available: readonly string[];
 }
 
 function counts(plugin: LoadedPlugin): string {
@@ -33,7 +34,7 @@ export function formatReport(input: ReportInput): string {
 		lines.push(`claude-plugins: loaded ${input.plugins.length} plugin(s)`);
 		for (const plugin of input.plugins) {
 			const origin = plugin.marketplace ? ` (from ${plugin.marketplace})` : "";
-			lines.push(`  ${plugin.name}${origin}: ${counts(plugin)}`);
+			lines.push(`  ${plugin.id}${origin}: ${counts(plugin)}`);
 			for (const refused of plugin.refused) lines.push(`    refused: ${refused}`);
 			for (const unsupported of plugin.unsupportedHooks) {
 				lines.push(`    unsupported hook ${unsupported}`);
@@ -41,13 +42,17 @@ export function formatReport(input: ReportInput): string {
 		}
 	}
 
-	if (!input.shellAllowed) {
-		const withShell = input.plugins.filter((plugin) =>
-			plugin.commands.some((command) => /!`|```!/.test(command.body)),
-		);
-		for (const plugin of withShell) {
-			lines.push(`  ${plugin.name}: shell expansion in commands is disabled`);
+	for (const plugin of input.plugins) {
+		if (plugin.trusted) continue;
+		if (plugin.commands.some((command) => /!`|```!/.test(command.body))) {
+			lines.push(`  ${plugin.id}: shell expansion in commands is disabled`);
 		}
+	}
+
+	if (input.available.length > 0) {
+		lines.push(
+			`  available but not enabled (add to claudePlugins.enabledPlugins): ${input.available.join(", ")}`,
+		);
 	}
 
 	for (const collision of input.collisions) {

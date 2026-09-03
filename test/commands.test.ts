@@ -1,18 +1,17 @@
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import {
 	discoverCommands,
 	expandArguments,
 	expandCommand,
-	expandFileReferences,
-	expandShell,
+	FILE_REFUSED_MARKER,
 	SHELL_DISABLED_MARKER,
 	splitArguments,
 } from "../src/commands.ts";
 import { readManifest } from "../src/manifest.ts";
-import type { SubstitutionVars } from "../src/types.ts";
+import type { PluginCommand, SubstitutionVars } from "../src/types.ts";
 import { FIXTURE_PLUGIN } from "./helpers.ts";
 
 const vars: SubstitutionVars = {
@@ -20,6 +19,17 @@ const vars: SubstitutionVars = {
 	CLAUDE_PLUGIN_DATA: "/data/demo",
 	CLAUDE_PROJECT_DIR: "/work",
 };
+
+function command(body: string, overrides: Partial<PluginCommand> = {}): PluginCommand {
+	return {
+		plugin: "demo-plugin",
+		name: "demo",
+		path: join(FIXTURE_PLUGIN, "commands/demo.md"),
+		argumentNames: [],
+		body,
+		...overrides,
+	};
+}
 
 describe("splitArguments", () => {
 	it("keeps quoted groups together", () => {
@@ -33,13 +43,11 @@ describe("splitArguments", () => {
 
 describe("expandArguments", () => {
 	it("indexes positional placeholders from zero, unlike pi templates", () => {
-		const { text } = expandArguments("$0 to $1", "SearchBar TypeScript", []);
-		expect(text).toBe("SearchBar to TypeScript");
+		expect(expandArguments("$0 to $1", "SearchBar TypeScript", []).text).toBe("SearchBar to TypeScript");
 	});
 
 	it("supports $ARGUMENTS[N]", () => {
-		const { text } = expandArguments("$ARGUMENTS[1]", "first second", []);
-		expect(text).toBe("second");
+		expect(expandArguments("$ARGUMENTS[1]", "first second", []).text).toBe("second");
 	});
 
 	it("resolves named arguments by declaration order", () => {
@@ -54,70 +62,152 @@ describe("expandArguments", () => {
 	});
 
 	it("leaves an out-of-range positional placeholder as literal text", () => {
-		const { text } = expandArguments("$0 $3", "only", []);
-		expect(text).toContain("only $3");
+		expect(expandArguments("$0 $3", "only", []).text).toContain("only $3");
+	});
+
+	it("leaves an undeclared $name alone", () => {
+		expect(expandArguments("cost is $total", "x", []).text).toContain("cost is $total");
+	});
+
+	it("does not rescan text an argument brought in", () => {
+		const { text } = expandArguments("$ARGUMENTS", "literal $0 and $ARGUMENTS", []);
+		expect(text).toBe("literal $0 and $ARGUMENTS");
 	});
 
 	it("appends ARGUMENTS when no placeholder consumed the input", () => {
-		const { text } = expandArguments("Do the thing.", "now", []);
-		expect(text).toBe("Do the thing.\n\nARGUMENTS: now");
+		expect(expandArguments("Do the thing.", "now", []).text).toBe("Do the thing.\n\nARGUMENTS: now");
 	});
 
 	it("does not append ARGUMENTS when there is nothing to append", () => {
-		const { text } = expandArguments("Do the thing.", "  ", []);
-		expect(text).toBe("Do the thing.");
+		expect(expandArguments("Do the thing.", "  ", []).text).toBe("Do the thing.");
 	});
 });
 
-describe("expandShell", () => {
-	it("substitutes inline and fenced command output", async () => {
-		const body = "inline: !`echo one`\n\n```!\necho two\n```\n";
-		const result = await expandShell(body, true, async (command) => `<${command}>`);
-		expect(result).toContain("<echo one>");
-		expect(result).toContain("<echo two>");
-	});
+describe("expandCommand shell injection", () => {
+	const base = { vars, cwd: FIXTURE_PLUGIN, pluginRoot: FIXTURE_PLUGIN, allowShell: true };
 
-	it("replaces commands with a marker when shell execution is not permitted", async () => {
-		const result = await expandShell("status: !`whoami`", false, async () => {
-			throw new Error("must not run");
+	it("never executes a shell command an argument smuggled in", async () => {
+		const run = vi.fn(async () => "authored output");
+		const expanded = await expandCommand({
+			...base,
+			command: command("Review $ARGUMENTS"),
+			rawArguments: "!`touch /tmp/pcp-pwned`",
+			run,
 		});
-		expect(result).toBe(`status: ${SHELL_DISABLED_MARKER}`);
+		expect(run).not.toHaveBeenCalled();
+		expect(expanded).toContain("!`touch /tmp/pcp-pwned`");
 	});
 
-	it("leaves a body with no commands untouched", async () => {
-		const body = "nothing to run here";
-		expect(await expandShell(body, true, async () => "x")).toBe(body);
+	it("never reads a file an argument smuggled in", async () => {
+		const expanded = await expandCommand({
+			...base,
+			command: command("Review $ARGUMENTS"),
+			rawArguments: "@/etc/hosts",
+			run: async () => "",
+		});
+		expect(expanded).toBe("Review @/etc/hosts");
+	});
+
+	it("cannot be tricked by an argument forging a slot delimiter", async () => {
+		const expanded = await expandCommand({
+			...base,
+			command: command("!`echo authored` then $ARGUMENTS"),
+			rawArguments: "deadbeef:s:0",
+			run: async () => "AUTHORED",
+		});
+		expect(expanded).toBe("AUTHORED then deadbeef:s:0");
+	});
+
+	it("still runs the commands the plugin author wrote", async () => {
+		const expanded = await expandCommand({
+			...base,
+			command: command("inline: !`echo one`\n\n```!\necho two\n```\n"),
+			rawArguments: "",
+			run: async (shellCommand) => `<${shellCommand}>`,
+		});
+		expect(expanded).toContain("<echo one>");
+		expect(expanded).toContain("<echo two>");
+	});
+
+	it("expands plugin placeholders inside an authored shell command", async () => {
+		const run = vi.fn(async () => "ok");
+		await expandCommand({
+			...base,
+			command: command("!`${CLAUDE_PLUGIN_ROOT}/scripts/x.sh`"),
+			rawArguments: "",
+			run,
+		});
+		expect(run).toHaveBeenCalledWith(`${FIXTURE_PLUGIN}/scripts/x.sh`);
+	});
+
+	it("marks authored commands when shell execution is not permitted", async () => {
+		const expanded = await expandCommand({
+			...base,
+			allowShell: false,
+			command: command("status: !`whoami`"),
+			rawArguments: "",
+			run: async () => {
+				throw new Error("must not run");
+			},
+		});
+		expect(expanded).toBe(`status: ${SHELL_DISABLED_MARKER}`);
 	});
 });
 
-describe("expandFileReferences", () => {
-	let dir: string;
+describe("expandCommand file references", () => {
+	let projectDir: string;
 
 	beforeAll(() => {
-		dir = mkdtempSync(join(tmpdir(), "pcp-refs-"));
-		writeFileSync(join(dir, "notes.md"), "line one\n");
+		projectDir = mkdtempSync(join(tmpdir(), "pcp-refs-"));
+		writeFileSync(join(projectDir, "notes.md"), "line one\n");
 	});
-	afterAll(() => rmSync(dir, { recursive: true, force: true }));
+	afterAll(() => rmSync(projectDir, { recursive: true, force: true }));
 
-	it("inlines a referenced file", () => {
-		const result = expandFileReferences("See @notes.md for details", dir);
+	const expand = (body: string, cwd: string) =>
+		expandCommand({
+			command: command(body),
+			rawArguments: "",
+			vars,
+			cwd,
+			pluginRoot: FIXTURE_PLUGIN,
+			allowShell: false,
+			run: async () => "",
+		});
+
+	it("inlines a file inside the project", async () => {
+		const result = await expand("See @notes.md for details", projectDir);
 		expect(result).toContain("// notes.md");
 		expect(result).toContain("line one");
 	});
 
-	it("leaves an unresolvable reference and an email address alone", () => {
+	it("inlines a file inside the plugin", async () => {
+		const result = await expand("See @skills/greeting/reference.md", FIXTURE_PLUGIN);
+		expect(result).toContain("House style");
+	});
+
+	it("refuses a file outside the project and the plugin", async () => {
+		const result = await expand("See @/etc/hosts", projectDir);
+		expect(result).toContain(FILE_REFUSED_MARKER);
+		expect(result).not.toContain("localhost");
+	});
+
+	it("refuses an escaping relative path", async () => {
+		const result = await expand("See @../../etc/hosts", projectDir);
+		expect(result).toContain(FILE_REFUSED_MARKER);
+	});
+
+	it("leaves an unresolvable reference and an email address alone", async () => {
 		const body = "@missing.md and someone@example.com";
-		expect(expandFileReferences(body, dir)).toBe(body);
+		expect(await expand(body, projectDir)).toBe(body);
 	});
 });
 
 describe("discoverCommands", () => {
 	it("reads the fixture plugin's commands with their frontmatter", () => {
 		const { commands } = discoverCommands("demo-plugin", FIXTURE_PLUGIN, readManifest(FIXTURE_PLUGIN));
-		const names = commands.map((command) => command.name).sort();
-		expect(names).toEqual(["review", "status"]);
+		expect(commands.map((entry) => entry.name).sort()).toEqual(["review", "status"]);
 
-		const review = commands.find((command) => command.name === "review");
+		const review = commands.find((entry) => entry.name === "review");
 		expect(review?.description).toBe("Review a file against the demo checklist");
 		expect(review?.argumentNames).toEqual(["path", "focus"]);
 	});
@@ -126,7 +216,7 @@ describe("discoverCommands", () => {
 describe("expandCommand", () => {
 	it("applies substitution, arguments, shell and file references in order", async () => {
 		const { commands } = discoverCommands("demo-plugin", FIXTURE_PLUGIN, readManifest(FIXTURE_PLUGIN));
-		const review = commands.find((command) => command.name === "review");
+		const review = commands.find((entry) => entry.name === "review");
 		expect(review).toBeDefined();
 		if (!review) return;
 
@@ -135,6 +225,7 @@ describe("expandCommand", () => {
 			rawArguments: "src/index.ts security",
 			vars,
 			cwd: FIXTURE_PLUGIN,
+			pluginRoot: FIXTURE_PLUGIN,
 			allowShell: false,
 			run: async () => "",
 		});
@@ -143,32 +234,5 @@ describe("expandCommand", () => {
 		expect(expanded).toContain(`Plugin root: ${FIXTURE_PLUGIN}`);
 		expect(expanded).toContain("First argument: src/index.ts");
 		expect(expanded).toContain("All arguments: src/index.ts security");
-	});
-
-	it("runs the shell only when permitted", async () => {
-		const { commands } = discoverCommands("demo-plugin", FIXTURE_PLUGIN, readManifest(FIXTURE_PLUGIN));
-		const status = commands.find((command) => command.name === "status");
-		expect(status).toBeDefined();
-		if (!status) return;
-
-		const blocked = await expandCommand({
-			command: status,
-			rawArguments: "",
-			vars,
-			cwd: FIXTURE_PLUGIN,
-			allowShell: false,
-			run: async () => "alive",
-		});
-		expect(blocked).toContain(SHELL_DISABLED_MARKER);
-
-		const allowed = await expandCommand({
-			command: status,
-			rawArguments: "",
-			vars,
-			cwd: FIXTURE_PLUGIN,
-			allowShell: true,
-			run: async () => "alive",
-		});
-		expect(allowed).toContain("alive");
 	});
 });

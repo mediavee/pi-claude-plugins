@@ -1,10 +1,13 @@
 import { existsSync, readFileSync, realpathSync, statSync } from "node:fs";
-import { basename, isAbsolute, relative, resolve, sep } from "node:path";
+import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
 import type { PluginManifest } from "./types.ts";
 
 export const MANIFEST_PATH = ".claude-plugin/plugin.json";
 
 export class ManifestError extends Error {}
+
+const PATH_FIELDS = ["skills", "commands", "agents"] as const;
+const PATH_OR_INLINE_FIELDS = ["hooks", "mcpServers"] as const;
 
 export function readManifest(root: string): PluginManifest {
 	const path = resolve(root, MANIFEST_PATH);
@@ -18,37 +21,72 @@ export function readManifest(root: string): PluginManifest {
 	if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
 		throw new ManifestError(`${MANIFEST_PATH} must contain a JSON object`);
 	}
-	const manifest = parsed as PluginManifest;
+
+	const manifest = parsed as Record<string, unknown>;
 	if (manifest.name !== undefined && typeof manifest.name !== "string") {
 		throw new ManifestError(`${MANIFEST_PATH} "name" must be a string`);
 	}
 	if (manifest.keywords !== undefined && !Array.isArray(manifest.keywords)) {
 		throw new ManifestError(`${MANIFEST_PATH} "keywords" must be an array`);
 	}
-	return manifest;
+	// Without this, a number or object here reaches path APIs later and throws mid-discovery,
+	// taking every plugin queued behind it down with it.
+	for (const field of PATH_FIELDS) {
+		if (!isPathList(manifest[field])) {
+			throw new ManifestError(`${MANIFEST_PATH} "${field}" must be a string or an array of strings`);
+		}
+	}
+	for (const field of PATH_OR_INLINE_FIELDS) {
+		const value = manifest[field];
+		if (!isPathList(value) && !isPlainObject(value)) {
+			throw new ManifestError(
+				`${MANIFEST_PATH} "${field}" must be a string, an array of strings, or an object`,
+			);
+		}
+	}
+	return manifest as PluginManifest;
+}
+
+function isPathList(value: unknown): boolean {
+	if (value === undefined || typeof value === "string") return true;
+	return Array.isArray(value) && value.every((item) => typeof item === "string");
+}
+
+function isPlainObject(value: unknown): boolean {
+	return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 export function pluginNameFor(root: string, manifest: PluginManifest): string {
 	return manifest.name?.trim() || basename(resolve(root));
 }
 
-/**
- * Claude Code rejects any component path that leaves the plugin directory, symlinks included.
- * The plugin still loads; only the offending component is dropped.
- */
-export function isInsidePlugin(root: string, candidate: string): boolean {
-	const realRoot = safeRealpath(resolve(root));
-	const realCandidate = safeRealpath(resolve(realRoot, candidate));
+/** True when `candidate` resolves to `root` itself or somewhere beneath it, symlinks followed. */
+export function isInside(root: string, candidate: string): boolean {
+	const realRoot = canonical(resolve(root));
+	const realCandidate = canonical(resolve(realRoot, candidate));
 	if (realRoot === realCandidate) return true;
 	const rel = relative(realRoot, realCandidate);
 	return rel !== "" && !rel.startsWith("..") && !isAbsolute(rel);
 }
 
-function safeRealpath(path: string): string {
-	try {
-		return realpathSync(path);
-	} catch {
-		return path;
+/**
+ * Realpath of the deepest existing ancestor, with the remaining segments appended.
+ *
+ * A path that does not exist yet still has to be comparable against a canonicalised root, or a
+ * containment check would fail wherever the root itself is behind a symlink such as macOS /var.
+ */
+function canonical(path: string): string {
+	let head = path;
+	const tail: string[] = [];
+	for (;;) {
+		try {
+			return join(realpathSync(head), ...tail);
+		} catch {
+			const parent = dirname(head);
+			if (parent === head) return path;
+			tail.unshift(basename(head));
+			head = parent;
+		}
 	}
 }
 
@@ -60,6 +98,7 @@ function asList(value: string | string[] | undefined): string[] {
 export interface ResolvedPaths {
 	paths: string[];
 	escaped: string[];
+	invalid: string[];
 }
 
 /**
@@ -79,9 +118,14 @@ export function resolveComponentPaths(
 
 	const paths: string[] = [];
 	const escaped: string[] = [];
+	const invalid: string[] = [];
 	for (const entry of candidates) {
+		if (typeof entry !== "string") {
+			invalid.push(`ignored a non-string entry in "${defaultDir}"`);
+			continue;
+		}
 		const normalized = entry === "." ? "./" : entry;
-		if (!isInsidePlugin(root, normalized)) {
+		if (!isInside(root, normalized)) {
 			escaped.push(entry);
 			continue;
 		}
@@ -89,7 +133,7 @@ export function resolveComponentPaths(
 		if (!existsSync(absolute)) continue;
 		if (!paths.includes(absolute)) paths.push(absolute);
 	}
-	return { paths, escaped };
+	return { paths, escaped, invalid };
 }
 
 export function isDirectory(path: string): boolean {
@@ -98,8 +142,4 @@ export function isDirectory(path: string): boolean {
 	} catch {
 		return false;
 	}
-}
-
-export function joinInside(root: string, ...segments: string[]): string {
-	return resolve(root, segments.join(sep));
 }

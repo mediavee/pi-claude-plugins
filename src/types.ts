@@ -28,6 +28,12 @@ export interface Diagnostic {
 }
 
 export interface DiscoveredPlugin {
+	/**
+	 * Origin-qualified identity, `name@marketplace` for a marketplace entry and the bare name
+	 * for a directory. Trust decisions key on this so one marketplace cannot inherit another
+	 * plugin's grants by reusing its name.
+	 */
+	id: string;
 	name: string;
 	root: string;
 	manifest: PluginManifest;
@@ -41,6 +47,8 @@ export interface SkillSource {
 	path: string;
 	/** Frontmatter name, falling back to the directory name. */
 	name: string;
+	/** The body uses `${CLAUDE_*}` placeholders, which pi cannot expand on its own. */
+	needsSubstitution: boolean;
 }
 
 export interface PluginCommand {
@@ -62,8 +70,11 @@ export interface PluginAgent {
 	description: string;
 	systemPrompt: string;
 	model?: string;
+	thinkingLevel?: string;
 	/** pi tool names, already mapped from the Claude names in frontmatter. */
 	tools?: string[];
+	/** pi tool names to exclude, mapped from `disallowedTools`. */
+	excludeTools?: string[];
 }
 
 export type HookEventName =
@@ -79,7 +90,9 @@ export interface HookHandler {
 	command?: string;
 	args?: string[];
 	timeout?: number;
-	shell?: string;
+	shell?: "bash" | "powershell";
+	/** One permission rule, such as `Bash(git *)`, narrowing when the handler runs. */
+	if?: string;
 }
 
 export interface HookMatcherGroup {
@@ -88,7 +101,7 @@ export interface HookMatcherGroup {
 }
 
 export interface HooksConfig {
-	hooks?: Partial<Record<string, HookMatcherGroup[]>>;
+	hooks?: Partial<Record<string, HookMatcherGroup[] | undefined>>;
 }
 
 export interface PluginHook {
@@ -111,7 +124,7 @@ export interface McpServerEntry {
 }
 
 export interface McpConfig {
-	mcpServers?: Record<string, McpServerEntry>;
+	mcpServers?: Record<string, McpServerEntry | undefined>;
 }
 
 export interface PluginMcpServer {
@@ -122,6 +135,8 @@ export interface PluginMcpServer {
 }
 
 export interface LoadedPlugin extends DiscoveredPlugin {
+	/** Whether this plugin may run hooks and `!` expansions. */
+	trusted: boolean;
 	skills: SkillSource[];
 	commands: PluginCommand[];
 	agents: PluginAgent[];
@@ -140,6 +155,8 @@ export interface PluginSettings {
 	allowHooks: boolean;
 	trustedPlugins: string[];
 	disabledPlugins: string[];
+	/** Marketplace entries to load; a catalog on its own installs nothing. */
+	enabledPlugins: string[];
 	agents: boolean;
 }
 

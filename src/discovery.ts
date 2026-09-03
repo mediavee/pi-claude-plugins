@@ -2,7 +2,7 @@ import { existsSync } from "node:fs";
 import { resolve } from "node:path";
 import { discoverAgents } from "./agents.ts";
 import { discoverCommands } from "./commands.ts";
-import { isPluginTrusted } from "./config.ts";
+import { isPluginEnabled, isPluginTrusted } from "./config.ts";
 import { discoverHooks } from "./hooks.ts";
 import { ManifestError, pluginNameFor, readManifest } from "./manifest.ts";
 import { MarketplaceError, readMarketplace } from "./marketplace.ts";
@@ -22,11 +22,14 @@ export interface LoadResult {
 	plugins: LoadedPlugin[];
 	diagnostics: Diagnostic[];
 	collisions: SkillCollision[];
+	/** Marketplace entries on disk that no `enabledPlugins` entry selects. */
+	available: string[];
 }
 
 export function loadPlugins(options: LoadOptions): LoadResult {
 	const diagnostics: Diagnostic[] = [];
-	const roots = collectRoots(options.settings, diagnostics);
+	const available: string[] = [];
+	const roots = collectRoots(options.settings, diagnostics, available);
 	const plugins: LoadedPlugin[] = [];
 	const seen = new Set<string>();
 
@@ -39,13 +42,24 @@ export function loadPlugins(options: LoadOptions): LoadResult {
 			});
 			continue;
 		}
-		const loaded = loadPlugin(candidate, options, diagnostics);
+		// One malformed plugin must not take down the plugins queued behind it.
+		let loaded: LoadedPlugin | undefined;
+		try {
+			loaded = loadPlugin(candidate, options, diagnostics);
+		} catch (error) {
+			diagnostics.push({
+				level: "error",
+				plugin: candidate.name ?? candidate.root,
+				message: `failed to load: ${(error as Error).message}`,
+			});
+			continue;
+		}
 		if (!loaded) continue;
 		if (seen.has(loaded.name)) {
 			diagnostics.push({
 				level: "warn",
-				plugin: loaded.name,
-				message: `already loaded from another source; ${loaded.root} was skipped`,
+				plugin: loaded.id,
+				message: `another plugin already uses the name "${loaded.name}"; ${loaded.root} was skipped`,
 			});
 			continue;
 		}
@@ -54,7 +68,7 @@ export function loadPlugins(options: LoadOptions): LoadResult {
 	}
 
 	const collisions = findSkillCollisions(plugins.flatMap((plugin) => plugin.skills));
-	return { plugins, diagnostics, collisions };
+	return { plugins, diagnostics, collisions, available };
 }
 
 interface Candidate {
@@ -63,13 +77,19 @@ interface Candidate {
 	marketplace?: string;
 }
 
-function collectRoots(settings: PluginSettings, diagnostics: Diagnostic[]): Candidate[] {
+function collectRoots(settings: PluginSettings, diagnostics: Diagnostic[], available: string[]): Candidate[] {
 	const candidates: Candidate[] = settings.paths.map((root) => ({ root }));
 
 	for (const marketplaceRoot of settings.marketplaces) {
 		try {
 			const marketplace = readMarketplace(marketplaceRoot);
 			for (const entry of marketplace.plugins) {
+				const id = `${entry.name}@${marketplace.name}`;
+				// Adding a catalog is not installing from it, so an entry has to be selected.
+				if (!isPluginEnabled(settings, id) && !isPluginEnabled(settings, entry.name)) {
+					available.push(id);
+					continue;
+				}
 				candidates.push({ root: entry.root, name: entry.name, marketplace: marketplace.name });
 			}
 			for (const entry of marketplace.unresolved) {
@@ -103,62 +123,60 @@ function loadPlugin(
 
 	// A marketplace entry's name is what users enable and disable the plugin by.
 	const name = candidate.name ?? pluginNameFor(candidate.root, manifest);
-	if (options.settings.disabledPlugins.includes(name)) return undefined;
+	const id = candidate.marketplace ? `${name}@${candidate.marketplace}` : name;
+	if (options.settings.disabledPlugins.includes(id)) return undefined;
 
 	const vars: SubstitutionVars = {
 		CLAUDE_PLUGIN_ROOT: candidate.root,
-		CLAUDE_PLUGIN_DATA: resolve(options.dataRoot, name.replace(/[^\w-]+/g, "-")),
+		CLAUDE_PLUGIN_DATA: resolve(options.dataRoot, id.replace(/[^\w-]+/g, "-")),
 		CLAUDE_PROJECT_DIR: options.cwd,
 	};
 
+	const warn = (message: string) => diagnostics.push({ level: "warn", plugin: id, message });
 	const refused: string[] = [];
 	const escaped: string[] = [];
 
 	const skills = discoverSkills(name, candidate.root, manifest);
 	escaped.push(...skills.escaped);
+	for (const warning of skills.warnings) warn(warning);
 
 	const commands = discoverCommands(name, candidate.root, manifest);
 	escaped.push(...commands.escaped);
+	for (const warning of commands.warnings) warn(warning);
 
-	const agentsAllowed = options.settings.agents;
-	const agents = agentsAllowed
+	const agents = options.settings.agents
 		? discoverAgents(name, candidate.root, manifest, vars)
 		: { agents: [], escaped: [], warnings: [] };
 	escaped.push(...agents.escaped);
-	for (const warning of agents.warnings) {
-		diagnostics.push({ level: "warn", plugin: name, message: warning });
-	}
+	for (const warning of agents.warnings) warn(warning);
 
-	const hooksAllowed = isPluginTrusted(options.settings, name, options.settings.allowHooks);
+	const trusted = isPluginTrusted(options.settings, id, options.settings.allowHooks);
 	const hooks = discoverHooks(name, candidate.root, manifest, vars);
 	escaped.push(...hooks.escaped);
-	if (!hooksAllowed && hooks.hooks.length > 0) {
+	for (const warning of hooks.warnings) warn(warning);
+	if (!trusted && hooks.hooks.length > 0) {
 		refused.push(`${hooks.hooks.length} hook handler(s): not trusted to run shell commands`);
 	}
 
 	const mcp = discoverMcpServers(name, candidate.root, manifest, vars, options.env);
 	escaped.push(...mcp.escaped);
-	for (const warning of mcp.warnings) {
-		diagnostics.push({ level: "warn", plugin: name, message: warning });
-	}
+	for (const warning of mcp.warnings) warn(warning);
 
 	for (const path of escaped) {
-		diagnostics.push({
-			level: "warn",
-			plugin: name,
-			message: `component path "${path}" escapes the plugin directory and was dropped`,
-		});
+		warn(`component path "${path}" escapes the plugin directory and was dropped`);
 	}
 
 	return {
+		id,
 		name,
 		root: candidate.root,
 		manifest,
 		...(candidate.marketplace ? { marketplace: candidate.marketplace } : {}),
+		trusted,
 		skills: skills.skills,
 		commands: commands.commands,
 		agents: agents.agents,
-		hooks: hooksAllowed ? hooks.hooks : [],
+		hooks: trusted ? hooks.hooks : [],
 		mcpServers: mcp.servers,
 		unsupportedHooks: hooks.unsupported,
 		refused,

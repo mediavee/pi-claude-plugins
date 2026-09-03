@@ -12,6 +12,7 @@ const DEFAULTS: PluginSettings = {
 	allowHooks: false,
 	trustedPlugins: [],
 	disabledPlugins: [],
+	enabledPlugins: [],
 	agents: true,
 };
 
@@ -72,6 +73,14 @@ function envPaths(value: string | undefined): string[] {
 		.map((entry) => expandHome(entry));
 }
 
+function envNames(value: string | undefined): string[] {
+	if (!value) return [];
+	return value
+		.split(/[,:]/)
+		.map((entry) => entry.trim())
+		.filter((entry) => entry.length > 0);
+}
+
 function applyScope(target: PluginSettings, raw: Record<string, unknown> | undefined, baseDir: string): void {
 	const section = raw?.[SETTINGS_KEY];
 	if (typeof section !== "object" || section === null || Array.isArray(section)) return;
@@ -94,6 +103,9 @@ function applyScope(target: PluginSettings, raw: Record<string, unknown> | undef
 	for (const name of stringArray(config.disabledPlugins) ?? []) {
 		if (!target.disabledPlugins.includes(name)) target.disabledPlugins.push(name);
 	}
+	for (const name of stringArray(config.enabledPlugins) ?? []) {
+		if (!target.enabledPlugins.includes(name)) target.enabledPlugins.push(name);
+	}
 }
 
 /**
@@ -109,6 +121,7 @@ export function resolveSettings(options: ResolveSettingsOptions): PluginSettings
 		marketplaces: [],
 		trustedPlugins: [],
 		disabledPlugins: [],
+		enabledPlugins: [],
 	};
 
 	applyScope(settings, readJson(resolve(options.agentDir, "settings.json")), options.agentDir);
@@ -125,12 +138,24 @@ export function resolveSettings(options: ResolveSettingsOptions): PluginSettings
 		const resolved = resolve(options.cwd, path);
 		if (!settings.marketplaces.includes(resolved)) settings.marketplaces.push(resolved);
 	}
+	for (const name of envNames(env.PI_CLAUDE_PLUGINS_ENABLED)) {
+		if (!settings.enabledPlugins.includes(name)) settings.enabledPlugins.push(name);
+	}
 	settings.allowHooks = envFlag(env.PI_CLAUDE_PLUGINS_ALLOW_HOOKS) ?? settings.allowHooks;
 	settings.allowShellCommands = envFlag(env.PI_CLAUDE_PLUGINS_ALLOW_SHELL) ?? settings.allowShellCommands;
 
 	return settings;
 }
 
-export function isPluginTrusted(settings: PluginSettings, plugin: string, global: boolean): boolean {
-	return global || settings.trustedPlugins.includes(plugin);
+/**
+ * Trust is keyed on the origin-qualified id so a marketplace cannot inherit another plugin's
+ * grant by reusing its bare name. A directory-sourced plugin's id is already its bare name.
+ */
+export function isPluginTrusted(settings: PluginSettings, id: string, global: boolean): boolean {
+	return global || settings.trustedPlugins.includes(id);
+}
+
+/** A marketplace is a catalog: an entry loads only once it is named in `enabledPlugins`. */
+export function isPluginEnabled(settings: PluginSettings, id: string): boolean {
+	return settings.enabledPlugins.includes(id);
 }

@@ -1,5 +1,5 @@
 import { spawn } from "node:child_process";
-import { mkdirSync } from "node:fs";
+import { mkdirSync, rmSync } from "node:fs";
 import { resolve } from "node:path";
 import { type ExtensionAPI, type ExtensionContext, getAgentDir } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
@@ -10,13 +10,16 @@ import { loadPlugins } from "./discovery.ts";
 import {
 	type HookDecision,
 	type HookEventName,
+	type HookExecution,
 	type HookInput,
 	hooksFor,
 	mergeDecisions,
+	plainContext,
 	runHook,
 } from "./hooks.ts";
 import { type McpRegistration, registerMcpServer } from "./mcp.ts";
 import { formatReport } from "./report.ts";
+import { materialiseSkill } from "./skills.ts";
 import { claudeInputToPi, piInputToClaude, piToolToClaude } from "./tool-names.ts";
 import type { LoadedPlugin, PluginAgent, PluginHook, SubstitutionVars } from "./types.ts";
 
@@ -24,6 +27,8 @@ const AGENT_TOOL = "claude_plugin_agent";
 const MESSAGE_TYPE = "claude-plugins";
 /** Matches Claude Code, which ends a turn after eight consecutive Stop-hook continuations. */
 const MAX_STOP_CONTINUATIONS = 8;
+const SHELL_TIMEOUT_MS = 120_000;
+const MAX_SHELL_OUTPUT_BYTES = 1_000_000;
 
 interface State {
 	plugins: LoadedPlugin[];
@@ -31,8 +36,9 @@ interface State {
 	agents: PluginAgent[];
 	registrations: McpRegistration[];
 	report: string;
-	allowShell: boolean;
+	skillPaths: string[];
 	dataRoot: string;
+	stagingRoot: string;
 	pendingContext: string[];
 	stopContinuations: number;
 	registeredCommands: Set<string>;
@@ -47,8 +53,9 @@ function emptyState(): State {
 		agents: [],
 		registrations: [],
 		report: "",
-		allowShell: false,
+		skillPaths: [],
 		dataRoot: "",
+		stagingRoot: "",
 		pendingContext: [],
 		stopContinuations: 0,
 		registeredCommands: new Set(),
@@ -71,15 +78,17 @@ export default function claudePlugins(pi: ExtensionAPI): void {
 			agentDir,
 			projectTrusted: ctx.isProjectTrusted(),
 		});
-		state.allowShell = settings.allowShellCommands;
 		state.dataRoot = resolve(agentDir, "claude-plugins", "data");
+		state.stagingRoot = resolve(agentDir, "claude-plugins", "skills");
+		rmSync(state.stagingRoot, { recursive: true, force: true });
 
 		const result = loadPlugins({ settings, cwd: ctx.cwd, dataRoot: state.dataRoot });
 		state.plugins = result.plugins;
 		state.hooks = result.plugins.flatMap((plugin) => plugin.hooks);
 		state.agents = result.plugins.flatMap((plugin) => plugin.agents);
+		state.skillPaths = resolveSkillPaths(state, ctx);
 
-		registerCommands(pi, state, ctx);
+		registerCommands(pi, state, settings.allowShellCommands, ctx);
 		registerAgentTool(pi, state);
 
 		const mcpUnavailable = registerMcpServers(pi, state);
@@ -88,7 +97,7 @@ export default function claudePlugins(pi: ExtensionAPI): void {
 			diagnostics: result.diagnostics,
 			collisions: result.collisions,
 			mcpUnavailable,
-			shellAllowed: settings.allowShellCommands,
+			available: result.available,
 		});
 		announce(ctx, state.report);
 
@@ -101,9 +110,7 @@ export default function claudePlugins(pi: ExtensionAPI): void {
 		await Promise.all(registrations.map((registration) => registration.dispose().catch(() => {})));
 	});
 
-	pi.on("resources_discover", () => ({
-		skillPaths: state.plugins.flatMap((plugin) => plugin.skills.map((skill) => skill.path)),
-	}));
+	pi.on("resources_discover", () => ({ skillPaths: state.skillPaths }));
 
 	pi.registerCommand("claude-plugins", {
 		description: "Show which Claude Code plugins are loaded",
@@ -117,16 +124,19 @@ export default function claudePlugins(pi: ExtensionAPI): void {
 		const hooks = hooksFor(state.hooks, "UserPromptSubmit", undefined);
 		if (hooks.length === 0) return { action: "continue" as const };
 
-		const decision = await runHooks(state, ctx, hooks, {
+		const executions = await runHooks(state, ctx, hooks, {
 			...baseInput(ctx, "UserPromptSubmit"),
 			prompt: event.text,
 		});
+		const decision = mergeDecisions(executions);
 		notifyWarnings(ctx, decision);
-		if (decision.blocked) {
-			ctx.ui.notify(decision.reason ?? "prompt blocked by a plugin hook", "warning");
+
+		if (decision.outcome === "deny" || decision.terminate) {
+			ctx.ui.notify(decision.stopReason ?? decision.reason ?? "prompt blocked by a plugin hook", "warning");
 			return { action: "handled" as const };
 		}
-		state.pendingContext.push(...decision.additionalContext);
+		// Plain stdout is context on this event, unlike everywhere else.
+		state.pendingContext.push(...decision.additionalContext, ...plainContext(executions));
 		return { action: "continue" as const };
 	});
 
@@ -139,25 +149,29 @@ export default function claudePlugins(pi: ExtensionAPI): void {
 
 	pi.on("tool_call", async (event, ctx) => {
 		const claudeName = piToolToClaude(event.toolName);
-		const hooks = hooksFor(state.hooks, "PreToolUse", claudeName);
+		const input = event.input as Record<string, unknown>;
+		const claudeInput = piInputToClaude(event.toolName, input, ctx.cwd);
+		const hooks = hooksFor(state.hooks, "PreToolUse", claudeName, claudeInput);
 		if (hooks.length === 0) return;
 
-		const input = event.input as Record<string, unknown>;
-		const decision = await runHooks(state, ctx, hooks, {
+		const executions = await runHooks(state, ctx, hooks, {
 			...baseInput(ctx, "PreToolUse"),
 			tool_name: claudeName,
-			tool_input: piInputToClaude(event.toolName, input),
+			tool_input: claudeInput,
 			tool_use_id: event.toolCallId,
 		});
+		const decision = mergeDecisions(executions);
 		notifyWarnings(ctx, decision);
 
 		if (decision.updatedInput) {
 			replaceInput(input, claudeInputToPi(event.toolName, decision.updatedInput));
 		}
 		for (const context of decision.additionalContext) {
-			await pi.sendMessage({ customType: MESSAGE_TYPE, content: context, display: false });
+			pi.sendMessage({ customType: MESSAGE_TYPE, content: context, display: false });
 		}
-		if (decision.blocked) {
+
+		const outcome = await resolveOutcome(ctx, decision, claudeName);
+		if (outcome === "deny") {
 			state.blockedCalls.add(event.toolCallId);
 			return {
 				block: true,
@@ -165,44 +179,65 @@ export default function claudePlugins(pi: ExtensionAPI): void {
 				terminate: decision.terminate,
 			};
 		}
+		if (decision.terminate) ctx.abort();
 	});
 
 	pi.on("tool_result", async (event, ctx) => {
 		if (state.blockedCalls.delete(event.toolCallId)) return;
+		// Claude Code routes a failed call to PostToolUseFailure, an event pi cannot express.
+		if (event.isError) return;
+
 		const claudeName = piToolToClaude(event.toolName);
-		const hooks = hooksFor(state.hooks, "PostToolUse", claudeName);
+		const claudeInput = piInputToClaude(event.toolName, event.input, ctx.cwd);
+		const hooks = hooksFor(state.hooks, "PostToolUse", claudeName, claudeInput);
 		if (hooks.length === 0) return;
 
-		const decision = await runHooks(state, ctx, hooks, {
-			...baseInput(ctx, "PostToolUse"),
-			tool_name: claudeName,
-			tool_input: piInputToClaude(event.toolName, event.input),
-			tool_response: event.content,
-			tool_use_id: event.toolCallId,
-		});
+		const decision = mergeDecisions(
+			await runHooks(state, ctx, hooks, {
+				...baseInput(ctx, "PostToolUse"),
+				tool_name: claudeName,
+				tool_input: claudeInput,
+				tool_response: toolResponse(event.content, event.details),
+				tool_use_id: event.toolCallId,
+			}),
+		);
 		notifyWarnings(ctx, decision);
 
+		if (decision.terminate) ctx.abort();
+
+		if (decision.updatedToolOutput !== undefined) {
+			return { content: [{ type: "text" as const, text: renderOutput(decision.updatedToolOutput) }] };
+		}
 		const extra = [...decision.additionalContext];
-		if (decision.blocked && decision.reason) extra.push(decision.reason);
+		if (decision.outcome === "deny" && decision.reason) extra.push(decision.reason);
 		if (extra.length === 0) return;
 		return { content: [...event.content, { type: "text" as const, text: extra.join("\n\n") }] };
 	});
 
-	pi.on("agent_end", async (_event, ctx) => {
+	pi.on("agent_end", async (event, ctx) => {
 		const hooks = hooksFor(state.hooks, "Stop", undefined);
 		if (hooks.length === 0) return;
+		// Claude Code does not run Stop hooks when the user interrupted the turn.
+		if (wasAborted(event.messages)) return;
 
-		const active = state.stopContinuations > 0;
-		const decision = await runHooks(state, ctx, hooks, {
-			...baseInput(ctx, "Stop"),
-			stop_hook_active: active,
-		});
+		const decision = mergeDecisions(
+			await runHooks(state, ctx, hooks, {
+				...baseInput(ctx, "Stop"),
+				stop_hook_active: state.stopContinuations > 0,
+				last_assistant_message: lastAssistantText(event.messages),
+			}),
+		);
 		notifyWarnings(ctx, decision);
 
-		// Claude Code's Stop block continues the conversation with the reason handed to the model.
-		if (decision.blocked && state.stopContinuations < MAX_STOP_CONTINUATIONS) {
+		// `continue: false` outranks a block: the hook asked to stop, not to keep going.
+		if (decision.terminate) {
+			state.stopContinuations = 0;
+			ctx.ui.notify(decision.stopReason ?? "a plugin hook stopped the run", "warning");
+			return;
+		}
+		if (decision.outcome === "deny" && state.stopContinuations < MAX_STOP_CONTINUATIONS) {
 			state.stopContinuations += 1;
-			await pi.sendMessage(
+			pi.sendMessage(
 				{
 					customType: MESSAGE_TYPE,
 					content: decision.reason ?? "A plugin hook asked you to keep working.",
@@ -220,14 +255,19 @@ export default function claudePlugins(pi: ExtensionAPI): void {
 		const hooks = hooksFor(state.hooks, "PreCompact", trigger);
 		if (hooks.length === 0) return;
 
-		const decision = await runHooks(state, ctx, hooks, {
-			...baseInput(ctx, "PreCompact"),
-			trigger,
-			custom_instructions: event.customInstructions ?? null,
-		});
+		const decision = mergeDecisions(
+			await runHooks(state, ctx, hooks, {
+				...baseInput(ctx, "PreCompact"),
+				trigger,
+				custom_instructions: event.customInstructions ?? null,
+			}),
+		);
 		notifyWarnings(ctx, decision);
-		if (decision.blocked) {
-			ctx.ui.notify(decision.reason ?? "compaction blocked by a plugin hook", "warning");
+		if (decision.outcome === "deny" || decision.terminate) {
+			ctx.ui.notify(
+				decision.stopReason ?? decision.reason ?? "compaction blocked by a plugin hook",
+				"warning",
+			);
 			return { cancel: true };
 		}
 	});
@@ -238,6 +278,27 @@ function announce(ctx: ExtensionContext, message: string): void {
 	// stdout carries the JSONL protocol in rpc and json modes, so stderr is the only safe sink.
 	if (ctx.mode === "tui") ctx.ui.notify(message, "info");
 	else console.error(message);
+}
+
+/** pi cannot expand `${CLAUDE_*}`, so a skill that uses one is served from a rewritten mirror. */
+function resolveSkillPaths(state: State, ctx: ExtensionContext): string[] {
+	const paths: string[] = [];
+	for (const plugin of state.plugins) {
+		for (const skill of plugin.skills) {
+			if (!skill.needsSubstitution) {
+				paths.push(skill.path);
+				continue;
+			}
+			const vars: SubstitutionVars = {
+				CLAUDE_PLUGIN_ROOT: plugin.root,
+				CLAUDE_PLUGIN_DATA: dataDirFor(state, plugin.id),
+				CLAUDE_PROJECT_DIR: ctx.cwd,
+				CLAUDE_SKILL_DIR: skill.path,
+			};
+			paths.push(materialiseSkill(skill, state.stagingRoot, vars));
+		}
+	}
+	return paths;
 }
 
 function baseInput(ctx: ExtensionContext, event: HookEventName): HookInput {
@@ -255,25 +316,37 @@ function replaceInput(target: Record<string, unknown>, next: Record<string, unkn
 	Object.assign(target, next);
 }
 
-async function runHooks(
-	state: State,
-	ctx: ExtensionContext,
-	hooks: readonly PluginHook[],
-	input: HookInput,
-): Promise<HookDecision> {
-	const executions = await Promise.all(
-		hooks.map((hook) =>
-			runHook({
-				hook,
-				input,
-				cwd: ctx.cwd,
-				projectDir: ctx.cwd,
-				dataDir: dataDirFor(state, hook.plugin),
-				...(ctx.signal ? { signal: ctx.signal } : {}),
-			}),
-		),
-	);
-	return mergeDecisions(executions);
+/** pi reports a rendered result; `details` is the closest thing to Claude's structured response. */
+function toolResponse(content: unknown, details: unknown): unknown {
+	if (details !== undefined && details !== null && Object.keys(details).length > 0) return details;
+	return content;
+}
+
+function renderOutput(value: unknown): string {
+	return typeof value === "string" ? value : JSON.stringify(value);
+}
+
+interface AgentMessageLike {
+	role?: string;
+	stopReason?: string;
+	content?: Array<{ type?: string; text?: string }>;
+}
+
+function wasAborted(messages: readonly unknown[]): boolean {
+	return messages.some((message) => (message as AgentMessageLike)?.stopReason === "aborted");
+}
+
+function lastAssistantText(messages: readonly unknown[]): string {
+	for (let index = messages.length - 1; index >= 0; index -= 1) {
+		const message = messages[index] as AgentMessageLike;
+		if (message?.role !== "assistant") continue;
+		const text = (message.content ?? [])
+			.filter((block) => block.type === "text" && typeof block.text === "string")
+			.map((block) => block.text as string)
+			.join("");
+		if (text) return text;
+	}
+	return "";
 }
 
 /** `${CLAUDE_PLUGIN_DATA}` is created on first reference upstream, so hooks can rely on it. */
@@ -285,6 +358,49 @@ function dataDirFor(state: State, plugin: string): string {
 		// A hook that needs the directory will report the failure itself.
 	}
 	return dir;
+}
+
+function runHooks(
+	state: State,
+	ctx: ExtensionContext,
+	hooks: readonly PluginHook[],
+	input: HookInput,
+): Promise<HookExecution[]> {
+	return Promise.all(
+		hooks.map((hook) =>
+			runHook({
+				hook,
+				input,
+				cwd: ctx.cwd,
+				projectDir: ctx.cwd,
+				dataDir: dataDirFor(state, hook.plugin),
+				...(ctx.signal ? { signal: ctx.signal } : {}),
+			}),
+		),
+	);
+}
+
+/**
+ * Turns an `ask` into a real confirmation. Without a UI there is nobody to ask, so the call is
+ * denied: silently allowing it would turn a hook that asked for review into one that approved.
+ */
+async function resolveOutcome(
+	ctx: ExtensionContext,
+	decision: HookDecision,
+	tool: string,
+): Promise<"allow" | "deny"> {
+	if (decision.outcome !== "ask") return decision.outcome;
+	if (!ctx.hasUI) {
+		decision.reason ??= "a plugin hook asked for confirmation and there is no UI to ask in";
+		return "deny";
+	}
+	const allowed = await ctx.ui.confirm(
+		`A plugin hook wants confirmation before ${tool}`,
+		decision.reason ?? "Allow this tool call?",
+	);
+	if (allowed) return "allow";
+	decision.reason ??= "declined at the plugin hook's confirmation prompt";
+	return "deny";
 }
 
 function notifyWarnings(ctx: ExtensionContext, decision: HookDecision): void {
@@ -301,17 +417,31 @@ async function runSessionStartHooks(
 	const hooks = hooksFor(state.hooks, "SessionStart", source);
 	if (hooks.length === 0) return;
 
-	const decision = await runHooks(state, ctx, hooks, { ...baseInput(ctx, "SessionStart"), source });
+	const executions = await runHooks(state, ctx, hooks, { ...baseInput(ctx, "SessionStart"), source });
+	const decision = mergeDecisions(executions);
 	notifyWarnings(ctx, decision);
-	if (decision.additionalContext.length === 0) return;
-	await pi.sendMessage(
-		{ customType: MESSAGE_TYPE, content: decision.additionalContext.join("\n\n"), display: false },
+	if (decision.terminate) {
+		ctx.ui.notify(decision.stopReason ?? "a plugin hook stopped the session", "warning");
+		return;
+	}
+
+	const context = [...decision.additionalContext, ...plainContext(executions)];
+	if (context.length === 0) return;
+	pi.sendMessage(
+		{ customType: MESSAGE_TYPE, content: context.join("\n\n"), display: false },
 		{ deliverAs: "nextTurn" },
 	);
 }
 
-function registerCommands(pi: ExtensionAPI, state: State, sessionCtx: ExtensionContext): void {
+function registerCommands(
+	pi: ExtensionAPI,
+	state: State,
+	globalShell: boolean,
+	sessionCtx: ExtensionContext,
+): void {
 	for (const plugin of state.plugins) {
+		// The configuration contract promises trustedPlugins grants shell expansion too.
+		const allowShell = globalShell || plugin.trusted;
 		for (const command of plugin.commands) {
 			const invocation = `${plugin.name}:${command.name}`;
 			if (state.registeredCommands.has(invocation)) continue;
@@ -319,7 +449,7 @@ function registerCommands(pi: ExtensionAPI, state: State, sessionCtx: ExtensionC
 
 			const vars: SubstitutionVars = {
 				CLAUDE_PLUGIN_ROOT: plugin.root,
-				CLAUDE_PLUGIN_DATA: dataDirFor(state, plugin.name),
+				CLAUDE_PLUGIN_DATA: dataDirFor(state, plugin.id),
 				CLAUDE_PROJECT_DIR: sessionCtx.cwd,
 			};
 
@@ -331,10 +461,14 @@ function registerCommands(pi: ExtensionAPI, state: State, sessionCtx: ExtensionC
 						rawArguments: args,
 						vars: { ...vars, CLAUDE_SESSION_ID: ctx.sessionManager.getSessionId() },
 						cwd: ctx.cwd,
-						allowShell: state.allowShell,
-						run: (shellCommand) => runShell(shellCommand, ctx.cwd),
+						pluginRoot: plugin.root,
+						allowShell,
+						run: (shellCommand) => runShell(shellCommand, ctx.cwd, ctx.signal),
 					});
-					await pi.sendUserMessage(expanded);
+					// sendUserMessage returns void and throws mid-stream without deliverAs, so the
+					// queueing mode is chosen here and the generated turn is awaited explicitly.
+					pi.sendUserMessage(expanded, ctx.isIdle() ? {} : { deliverAs: "followUp" });
+					await ctx.waitForIdle();
 				},
 			});
 		}
@@ -342,20 +476,56 @@ function registerCommands(pi: ExtensionAPI, state: State, sessionCtx: ExtensionC
 }
 
 /** Claude Code merges stderr into stdout for injected commands, so failures stay visible. */
-function runShell(command: string, cwd: string): Promise<string> {
+function runShell(command: string, cwd: string, signal: AbortSignal | undefined): Promise<string> {
 	return new Promise((resolvePromise) => {
-		const child = spawn(command, { cwd, shell: true, stdio: ["ignore", "pipe", "pipe"] });
+		const child = spawn(command, {
+			cwd,
+			shell: true,
+			detached: process.platform !== "win32",
+			stdio: ["ignore", "pipe", "pipe"],
+		});
 		let output = "";
+		let settled = false;
+
+		const terminate = () => {
+			if (child.pid === undefined) return;
+			try {
+				if (process.platform === "win32") child.kill("SIGTERM");
+				else process.kill(-child.pid, "SIGTERM");
+			} catch {
+				// The process group is already gone.
+			}
+		};
+
+		const finish = (text: string) => {
+			if (settled) return;
+			settled = true;
+			clearTimeout(timer);
+			signal?.removeEventListener("abort", onAbort);
+			resolvePromise(text.replace(/\s+$/, ""));
+		};
+
+		const timer = setTimeout(() => {
+			terminate();
+			finish(`${output}\n[command timed out]`);
+		}, SHELL_TIMEOUT_MS);
+		const onAbort = () => {
+			terminate();
+			finish(`${output}\n[command cancelled]`);
+		};
+		signal?.addEventListener("abort", onAbort, { once: true });
+
+		const collect = (chunk: string) => {
+			if (output.length < MAX_SHELL_OUTPUT_BYTES) output += chunk;
+			else terminate();
+		};
 		child.stdout.setEncoding("utf8");
-		child.stdout.on("data", (chunk: string) => {
-			output += chunk;
-		});
+		child.stdout.on("data", collect);
 		child.stderr.setEncoding("utf8");
-		child.stderr.on("data", (chunk: string) => {
-			output += chunk;
-		});
-		child.on("error", (error) => resolvePromise(`${output}${error.message}`));
-		child.on("close", () => resolvePromise(output.replace(/\s+$/, "")));
+		child.stderr.on("data", collect);
+
+		child.on("error", (error) => finish(`${output}${error.message}`));
+		child.on("close", () => finish(output));
 	});
 }
 

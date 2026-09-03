@@ -1,3 +1,6 @@
+import { homedir } from "node:os";
+import { isAbsolute, join, normalize, resolve } from "node:path";
+
 /**
  * Claude Code and pi name the same tools differently and shape their inputs differently.
  * Hook matchers and `tool_input` payloads written for Claude Code must see Claude's vocabulary,
@@ -30,6 +33,9 @@ const PI_TO_CLAUDE: Record<string, string> = {
 	ls: "LS",
 };
 
+/** pi's built-in tools, the set a child process gets when no `--tools` allowlist is passed. */
+export const DEFAULT_PI_TOOLS: readonly string[] = ["read", "write", "edit", "bash", "find", "grep", "ls"];
+
 export function claudeToolToPi(name: string): string | undefined {
 	return CLAUDE_TO_PI[name];
 }
@@ -60,26 +66,30 @@ export function mapClaudeToolList(names: readonly string[]): ToolNameMapping {
 
 type Json = Record<string, unknown>;
 
-function rename(input: Json, from: string, to: string): Json {
+function rename(input: Json, from: string, to: string, transform?: (value: unknown) => unknown): Json {
 	if (!(from in input)) return input;
 	const { [from]: value, ...rest } = input;
-	return { ...rest, [to]: value };
+	return { ...rest, [to]: transform ? transform(value) : value };
 }
 
-/** pi tool input -> the shape a Claude Code hook expects to read. */
-export function piInputToClaude(piTool: string, input: Json): Json {
-	switch (piTool) {
-		case "read":
-		case "write":
-		case "edit":
-		case "ls":
-			return rename(input, "path", "file_path");
-		case "grep":
-		case "find":
-			return input;
-		default:
-			return input;
-	}
+const FILE_TOOLS = new Set(["read", "write", "edit", "ls"]);
+
+/**
+ * pi tool input -> the shape a Claude Code hook expects to read.
+ *
+ * The path is made absolute because Claude Code guarantees that for the file tools, so a hook
+ * that gates on a path prefix cannot be bypassed by spelling the same file relatively.
+ */
+export function piInputToClaude(piTool: string, input: Json, cwd: string): Json {
+	if (!FILE_TOOLS.has(piTool)) return input;
+	return rename(input, "path", "file_path", (value) =>
+		typeof value === "string" ? absolutePath(value, cwd) : value,
+	);
+}
+
+function absolutePath(value: string, cwd: string): string {
+	const expanded = value === "~" || value.startsWith("~/") ? join(homedir(), value.slice(1)) : value;
+	return isAbsolute(expanded) ? normalize(expanded) : resolve(cwd, expanded);
 }
 
 /** A hook's `updatedInput` -> the shape pi's tool actually validates. */

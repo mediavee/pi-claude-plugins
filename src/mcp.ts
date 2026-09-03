@@ -1,7 +1,7 @@
 import { existsSync, readFileSync } from "node:fs";
 import { resolve } from "node:path";
-import { isInsidePlugin } from "./manifest.ts";
-import { substituteDeep } from "./substitute.ts";
+import { isInside } from "./manifest.ts";
+import { substituteEnvDeep } from "./substitute.ts";
 import type {
 	McpConfig,
 	McpServerEntry,
@@ -29,28 +29,29 @@ export function discoverMcpServers(
 	env: NodeJS.ProcessEnv = process.env,
 ): McpDiscovery {
 	const escaped: string[] = [];
+	const warnings: string[] = [];
 	const configs: McpConfig[] = [];
 
 	const declared = manifest.mcpServers;
 	if (declared !== undefined && !Array.isArray(declared) && typeof declared === "object") {
-		configs.push(declared);
+		configs.push(asMcpConfig(declared as Record<string, unknown>));
 	} else {
 		const entries = declared === undefined ? [".mcp.json"] : Array.isArray(declared) ? declared : [declared];
 		for (const entry of entries) {
 			if (typeof entry !== "string") continue;
-			if (!isInsidePlugin(root, entry)) {
+			if (!isInside(root, entry)) {
 				escaped.push(entry);
 				continue;
 			}
 			const path = resolve(root, entry);
 			if (!existsSync(path)) continue;
 			const parsed = readMcpFile(path);
-			if (parsed) configs.push(parsed);
+			if (parsed.config) configs.push(parsed.config);
+			if (parsed.error) warnings.push(`MCP config ${entry} was ignored: ${parsed.error}`);
 		}
 	}
 
 	const servers: PluginMcpServer[] = [];
-	const warnings: string[] = [];
 
 	for (const config of configs) {
 		for (const [name, rawEntry] of Object.entries(config.mcpServers ?? {})) {
@@ -59,7 +60,7 @@ export function discoverMcpServers(
 			const entry = { ...rawEntry } as Record<string, unknown>;
 			for (const field of EXPANDED_FIELDS) {
 				if (entry[field] === undefined) continue;
-				entry[field] = substituteDeep(entry[field], vars, { env, unresolved });
+				entry[field] = substituteEnvDeep(entry[field], vars, { env, unresolved });
 			}
 			if (unresolved.length > 0) {
 				warnings.push(
@@ -82,16 +83,29 @@ function sanitize(name: string): string {
 	return name.replace(/[^\w-]+/g, "_");
 }
 
-function readMcpFile(path: string): McpConfig | undefined {
-	try {
-		const parsed: unknown = JSON.parse(readFileSync(path, "utf8"));
-		if (typeof parsed === "object" && parsed !== null && !Array.isArray(parsed)) {
-			return parsed as McpConfig;
-		}
-	} catch {
-		return undefined;
+/**
+ * A `.mcp.json` file wraps the server map in `{ "mcpServers": … }`; an inline manifest value is
+ * the server map itself.
+ */
+function asMcpConfig(value: Record<string, unknown>): McpConfig {
+	const nested = value.mcpServers;
+	if (typeof nested === "object" && nested !== null && !Array.isArray(nested)) {
+		return value as McpConfig;
 	}
-	return undefined;
+	return { mcpServers: (value ?? {}) as NonNullable<McpConfig["mcpServers"]> };
+}
+
+function readMcpFile(path: string): { config?: McpConfig; error?: string } {
+	let parsed: unknown;
+	try {
+		parsed = JSON.parse(readFileSync(path, "utf8"));
+	} catch (error) {
+		return { error: (error as Error).message };
+	}
+	if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+		return { error: "expected a JSON object" };
+	}
+	return { config: asMcpConfig(parsed as Record<string, unknown>) };
 }
 
 export interface McpRegistration {
