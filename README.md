@@ -10,13 +10,13 @@ Works the same in the TUI and headless (`pi --mode rpc`, `pi --mode json`, `pi -
 ## Install
 
 ```bash
-pi install npm:pi-claude-plugins
+pi install npm:@mediavee/pi-claude-plugins
 ```
 
 Or try it for one run without installing:
 
 ```bash
-pi -e npm:pi-claude-plugins
+pi -e npm:@mediavee/pi-claude-plugins
 ```
 
 Requires pi `0.84.4` or later.
@@ -161,7 +161,8 @@ maps onto pi's thinking level where the names coincide. Everything refused is na
 
 Handlers receive Claude Code's JSON on stdin, with `tool_name` in Claude's vocabulary so matchers
 written upstream keep firing, and with `CLAUDE_PLUGIN_ROOT`, `CLAUDE_PLUGIN_DATA` and
-`CLAUDE_PROJECT_DIR` in their environment. Exit codes and JSON output follow the upstream
+`CLAUDE_PROJECT_DIR` in their environment. Shell-form handlers run under `bash`, as upstream, so
+`bash` must be on `PATH`. Exit codes and JSON output follow the upstream
 protocol: exit `2` blocks with stderr as the reason whatever the hook also printed, valid JSON on
 stdout is honoured on any exit code, and any other non-zero exit is a non-blocking error. When
 several hooks match they all run in parallel and their decisions merge with `deny` > `ask` >
@@ -237,7 +238,10 @@ you manage.
 
 Everything refused or unsupported is listed at startup, never silently ignored.
 
-Three smaller deviations worth knowing:
+Four smaller deviations worth knowing:
+
+- pi dispatches `/plugin:command` before its `input` event fires, so `UserPromptSubmit` hooks do
+  not see a typed plugin command, only the prompt it expands into on the next event.
 
 - `${CLAUDE_*}` placeholders are substituted before arguments, so an argument containing one
   reaches the model literally rather than being expanded.

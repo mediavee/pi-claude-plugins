@@ -1,5 +1,5 @@
 {
-	"name": "pi-claude-plugins",
+	"name": "@mediavee/pi-claude-plugins",
 	"version": "0.1.0",
 	"description": "pi extension that loads Claude Code plugins natively: skills, commands, agents, hooks and MCP servers",
 	"license": "MIT",
@@ -29,6 +29,9 @@
 		"CHANGELOG.md",
 		"LICENSE"
 	],
+	"publishConfig": {
+		"access": "public"
+	},
 	"pi": {
 		"extensions": [
 			"./src/index.ts"
