@@ -1,7 +1,7 @@
 import {
 	type Context,
-	createFauxCore,
 	fauxAssistantMessage,
+	fauxProvider,
 	fauxToolCall,
 	type Message,
 } from "@earendil-works/pi-ai";
@@ -62,31 +62,15 @@ function reply(context: Context) {
 }
 
 export default function fauxProviderExtension(pi: ExtensionAPI): void {
-	const core = createFauxCore({
+	const faux = fauxProvider({
 		provider: FAUX_PROVIDER,
 		models: [{ id: FAUX_MODEL, name: "Faux model", contextWindow: 200_000, maxTokens: 8192 }],
 	});
-	core.setResponses([]);
-
-	pi.registerProvider(FAUX_PROVIDER, {
-		name: "Faux",
-		baseUrl: "http://faux.invalid",
-		apiKey: "faux-key",
-		api: core.api as never,
-		models: [
-			{
-				id: FAUX_MODEL,
-				name: "Faux model",
-				reasoning: false,
-				input: ["text"],
-				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-				contextWindow: 200_000,
-				maxTokens: 8192,
-			},
-		],
-		streamSimple: (model, context, options) => {
-			core.setResponses([reply(context)]);
-			return core.streamSimple(model, context, options);
-		},
-	});
+	// Each reply re-queues itself, so the script is driven by the conversation, not by a fixed list.
+	const respond = (context: Context) => {
+		faux.appendResponses([respond]);
+		return reply(context);
+	};
+	faux.setResponses([respond]);
+	pi.registerProvider(faux.provider);
 }
