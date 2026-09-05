@@ -278,12 +278,13 @@ export function timeoutFor(hook: PluginHook): number {
 	return hook.event === "UserPromptSubmit" ? PROMPT_TIMEOUT_MS : DEFAULT_TIMEOUT_MS;
 }
 
+/** Claude Code runs shell-form handlers under bash, so bash-isms in existing hook scripts keep working. */
 function shellFor(hook: PluginHook): string | boolean {
 	if (hook.handler.args !== undefined) return false;
 	if (hook.handler.shell === "powershell") {
 		return process.platform === "win32" ? "powershell.exe" : "pwsh";
 	}
-	return process.platform === "win32" ? "bash.exe" : "/bin/sh";
+	return process.platform === "win32" ? "bash.exe" : "bash";
 }
 
 /**

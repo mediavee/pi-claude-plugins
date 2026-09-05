@@ -1,6 +1,6 @@
 import { spawn } from "node:child_process";
 import { mkdirSync, rmSync } from "node:fs";
-import { resolve } from "node:path";
+import { dirname, resolve } from "node:path";
 import { type ExtensionAPI, type ExtensionContext, getAgentDir } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { resolveAgent, runAgent } from "./agents.ts";
@@ -19,7 +19,7 @@ import {
 } from "./hooks.ts";
 import { type McpRegistration, registerMcpServer } from "./mcp.ts";
 import { formatReport } from "./report.ts";
-import { materialiseSkill } from "./skills.ts";
+import { materialiseSkill, sweepStaleStaging } from "./skills.ts";
 import { claudeInputToPi, piInputToClaude, piToolToClaude } from "./tool-names.ts";
 import type { LoadedPlugin, PluginAgent, PluginHook, SubstitutionVars } from "./types.ts";
 
@@ -79,7 +79,9 @@ export default function claudePlugins(pi: ExtensionAPI): void {
 			projectTrusted: ctx.isProjectTrusted(),
 		});
 		state.dataRoot = resolve(agentDir, "claude-plugins", "data");
-		state.stagingRoot = resolve(agentDir, "claude-plugins", "skills");
+		// Staged per process: concurrent headless sessions must not wipe each other's mirrors.
+		state.stagingRoot = resolve(agentDir, "claude-plugins", "skills", String(process.pid));
+		sweepStaleStaging(dirname(state.stagingRoot));
 		rmSync(state.stagingRoot, { recursive: true, force: true });
 
 		const result = loadPlugins({ settings, cwd: ctx.cwd, dataRoot: state.dataRoot });
@@ -108,6 +110,7 @@ export default function claudePlugins(pi: ExtensionAPI): void {
 		const registrations = state.registrations;
 		state.registrations = [];
 		await Promise.all(registrations.map((registration) => registration.dispose().catch(() => {})));
+		if (state.stagingRoot) rmSync(state.stagingRoot, { recursive: true, force: true });
 	});
 
 	pi.on("resources_discover", () => ({ skillPaths: state.skillPaths }));
@@ -413,7 +416,9 @@ async function runSessionStartHooks(
 	ctx: ExtensionContext,
 	reason: "startup" | "reload" | "new" | "resume" | "fork",
 ): Promise<void> {
-	const source = reason === "resume" || reason === "fork" ? reason : "startup";
+	const source = { startup: "startup", reload: "startup", new: "clear", resume: "resume", fork: "fork" }[
+		reason
+	];
 	const hooks = hooksFor(state.hooks, "SessionStart", source);
 	if (hooks.length === 0) return;
 
@@ -453,8 +458,9 @@ function registerCommands(
 				CLAUDE_PROJECT_DIR: sessionCtx.cwd,
 			};
 
+			const description = [command.argumentHint, command.description].filter(Boolean).join(" — ");
 			pi.registerCommand(invocation, {
-				...(command.description ? { description: command.description } : {}),
+				...(description ? { description } : {}),
 				handler: async (args, ctx) => {
 					const expanded = await expandCommand({
 						command,
@@ -463,7 +469,7 @@ function registerCommands(
 						cwd: ctx.cwd,
 						pluginRoot: plugin.root,
 						allowShell,
-						run: (shellCommand) => runShell(shellCommand, ctx.cwd, ctx.signal),
+						run: (shellCommand) => runShell(shellCommand, ctx.cwd, vars, ctx.signal),
 					});
 					// sendUserMessage returns void and throws mid-stream without deliverAs, so the
 					// queueing mode is chosen here and the generated turn is awaited explicitly.
@@ -476,13 +482,19 @@ function registerCommands(
 }
 
 /** Claude Code merges stderr into stdout for injected commands, so failures stay visible. */
-function runShell(command: string, cwd: string, signal: AbortSignal | undefined): Promise<string> {
+function runShell(
+	command: string,
+	cwd: string,
+	vars: SubstitutionVars,
+	signal: AbortSignal | undefined,
+): Promise<string> {
 	return new Promise((resolvePromise) => {
 		const child = spawn(command, {
 			cwd,
-			shell: true,
+			shell: process.platform === "win32" ? "bash.exe" : "bash",
 			detached: process.platform !== "win32",
 			stdio: ["ignore", "pipe", "pipe"],
+			env: { ...process.env, ...vars },
 		});
 		let output = "";
 		let settled = false;
@@ -563,7 +575,14 @@ function registerAgentTool(pi: ExtensionAPI, state: State): void {
 				task: params.task,
 				cwd: ctx.cwd,
 				...(signal ? { signal } : {}),
-				...(ctx.model?.id ? { fallbackModel: ctx.model.id } : {}),
+				...(ctx.model ? { fallbackModel: `${ctx.model.provider}/${ctx.model.id}` } : {}),
+				...(ctx.thinkingLevel ? { fallbackThinkingLevel: ctx.thinkingLevel } : {}),
+				env: {
+					...process.env,
+					CLAUDE_PLUGIN_ROOT: agent.root,
+					CLAUDE_PLUGIN_DATA: dataDirFor(state, agent.plugin),
+					CLAUDE_PROJECT_DIR: ctx.cwd,
+				},
 				onText: (text) => onUpdate?.({ content: [{ type: "text", text }], details: {} }),
 			});
 

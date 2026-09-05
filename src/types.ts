@@ -65,6 +65,8 @@ export interface PluginCommand {
 
 export interface PluginAgent {
 	plugin: string;
+	/** Plugin directory, exported to the child as CLAUDE_PLUGIN_ROOT. */
+	root: string;
 	name: string;
 	path: string;
 	description: string;

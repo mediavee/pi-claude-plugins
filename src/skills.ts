@@ -130,6 +130,34 @@ export function materialiseSkill(skill: SkillSource, stagingRoot: string, vars: 
 	}
 }
 
+/**
+ * Removes staging directories left behind by pi processes that are no longer running. Each
+ * session stages under its own pid so concurrent sessions never wipe each other's mirrors.
+ */
+export function sweepStaleStaging(stagingParent: string): void {
+	let entries: Dirent[];
+	try {
+		entries = readdirSync(stagingParent, { withFileTypes: true });
+	} catch {
+		return;
+	}
+	for (const entry of entries) {
+		if (!entry.isDirectory() || !/^\d+$/.test(entry.name)) continue;
+		const pid = Number(entry.name);
+		if (pid === process.pid || isRunning(pid)) continue;
+		rmSync(join(stagingParent, entry.name), { recursive: true, force: true });
+	}
+}
+
+function isRunning(pid: number): boolean {
+	try {
+		process.kill(pid, 0);
+		return true;
+	} catch (error) {
+		return (error as NodeJS.ErrnoException).code === "EPERM";
+	}
+}
+
 export interface SkillCollision {
 	name: string;
 	plugins: string[];

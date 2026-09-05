@@ -14,6 +14,7 @@ const vars: SubstitutionVars = {
 function agent(overrides: Partial<PluginAgent> = {}): PluginAgent {
 	return {
 		plugin: "demo-plugin",
+		root: "/plugins/demo",
 		name: "worker",
 		path: "/plugins/demo/agents/worker.md",
 		description: "does work",

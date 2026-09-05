@@ -37,7 +37,7 @@ export function discoverAgents(
 
 	for (const path of resolved.paths) {
 		for (const file of markdownFiles(path)) {
-			const parsed = parseAgent(plugin, file, vars);
+			const parsed = parseAgent(plugin, root, file, vars);
 			if (parsed.agent) agents.push(parsed.agent);
 			warnings.push(...parsed.warnings);
 		}
@@ -59,6 +59,7 @@ function markdownFiles(path: string): string[] {
 
 function parseAgent(
 	plugin: string,
+	root: string,
 	file: string,
 	vars: SubstitutionVars,
 ): { agent?: PluginAgent; warnings: string[] } {
@@ -123,6 +124,7 @@ function parseAgent(
 
 	const agent: PluginAgent = {
 		plugin,
+		root,
 		name,
 		path: file,
 		description:
@@ -151,6 +153,9 @@ export interface RunAgentOptions {
 	signal?: AbortSignal;
 	/** Model inherited from the dispatching session when the agent declares none. */
 	fallbackModel?: string;
+	/** Thinking level inherited alongside the model when the agent declares no effort. */
+	fallbackThinkingLevel?: string;
+	env?: NodeJS.ProcessEnv;
 	onText?: (text: string) => void;
 }
 
@@ -158,12 +163,17 @@ export interface RunAgentOptions {
  * Without an explicit allowlist the child falls back to pi's full default tool set, which is
  * wider than an author who wrote `disallowedTools` expects.
  */
-export function agentInvocationArgs(agent: PluginAgent, fallbackModel: string | undefined): string[] {
+export function agentInvocationArgs(
+	agent: PluginAgent,
+	fallbackModel: string | undefined,
+	fallbackThinkingLevel?: string,
+): string[] {
 	const args = ["--mode", "json", "-p", "--no-session"];
 
 	const model = agent.model ?? fallbackModel;
 	if (model) args.push("--model", model);
-	if (agent.thinkingLevel) args.push("--thinking", agent.thinkingLevel);
+	const thinking = agent.thinkingLevel ?? (agent.model ? undefined : fallbackThinkingLevel);
+	if (thinking) args.push("--thinking", thinking);
 
 	const allowed = agent.tools ?? [...DEFAULT_PI_TOOLS];
 	const effective = allowed.filter((tool) => !agent.excludeTools?.includes(tool));
@@ -185,7 +195,7 @@ export interface RunAgentResult {
  */
 export async function runAgent(options: RunAgentOptions): Promise<RunAgentResult> {
 	const { agent } = options;
-	const args = agentInvocationArgs(agent, options.fallbackModel);
+	const args = agentInvocationArgs(agent, options.fallbackModel, options.fallbackThinkingLevel);
 
 	let promptDir: string | undefined;
 	try {
@@ -221,6 +231,7 @@ function spawnPi(args: string[], options: RunAgentOptions): Promise<RunAgentResu
 			shell: false,
 			detached: process.platform !== "win32",
 			stdio: ["ignore", "pipe", "pipe"],
+			env: options.env ?? process.env,
 		});
 
 		const texts: string[] = [];

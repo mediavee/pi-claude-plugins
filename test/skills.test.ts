@@ -1,8 +1,16 @@
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import {
+	existsSync,
+	mkdirSync,
+	mkdtempSync,
+	readFileSync,
+	rmSync,
+	symlinkSync,
+	writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { discoverSkills, materialiseSkill } from "../src/skills.ts";
+import { discoverSkills, materialiseSkill, sweepStaleStaging } from "../src/skills.ts";
 import type { SubstitutionVars } from "../src/types.ts";
 
 const vars: SubstitutionVars = {
@@ -112,5 +120,19 @@ describe("materialiseSkill", () => {
 	it("falls back to the original directory when it cannot mirror", () => {
 		const skill = { plugin: "demo", path: "/nope/skill", name: "dyn", needsSubstitution: true };
 		expect(materialiseSkill(skill, staging, vars)).toBe("/nope/skill");
+	});
+});
+
+describe("sweepStaleStaging", () => {
+	it("removes directories of dead processes and keeps live ones", () => {
+		const parent = mkdtempSync(join(tmpdir(), "pcp-sweep-"));
+		mkdirSync(join(parent, String(process.pid)));
+		mkdirSync(join(parent, "999999"));
+		mkdirSync(join(parent, "not-a-pid"));
+		sweepStaleStaging(parent);
+		expect(existsSync(join(parent, String(process.pid)))).toBe(true);
+		expect(existsSync(join(parent, "999999"))).toBe(false);
+		expect(existsSync(join(parent, "not-a-pid"))).toBe(true);
+		rmSync(parent, { recursive: true, force: true });
 	});
 });
