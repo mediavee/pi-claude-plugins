@@ -81,7 +81,10 @@ pi does not implement Claude's `${CLAUDE_*}` substitution, so a skill body that 
 otherwise reach the model with a literal placeholder where a bundled script path belongs. Such a
 skill is served from a mirror directory: every sibling file and directory is symlinked and only
 `SKILL.md` is materialised with the placeholders expanded, so relative links and bundled assets
-still resolve. Skills without a placeholder — the overwhelming majority — are untouched.
+still resolve. Skills without a placeholder — the overwhelming majority — are untouched. Mirrors
+live under `~/.pi/agent/claude-plugins/skills/<pid>/` so concurrent headless sessions never wipe
+each other's; a session removes its own directory at shutdown and sweeps those of dead processes
+at startup.
 
 A plugin-root `SKILL.md` is loaded only when there is no `skills/` directory and no manifest
 `skills` field, matching Claude Code's single-skill-plugin rule, and it goes through the same
@@ -157,7 +160,9 @@ pi --mode json -p --no-session [--model M] [--thinking L] [--tools a,b] \
 ```
 
 `process.argv[1]` is preferred over a bare `pi` on `PATH` so the child is the same build as the
-parent, falling back to `pi` when the parent runs from a bundled binary.
+parent, falling back to `pi` when the parent runs from a bundled binary. An agent that declares
+no `model` inherits the parent's `provider/model` and thinking level, and every child gets the
+`CLAUDE_*` variables in its environment.
 
 Claude tool names in `tools` / `disallowedTools` frontmatter are mapped to pi's:
 
@@ -190,8 +195,8 @@ plugin-shipped agents upstream, and we refuse them too.
 | --- | --- | --- |
 | `PreToolUse` | `tool_call` | `{ block, reason, terminate }`; mutate `event.input` in place |
 | `PostToolUse` | `tool_result` | return a patch `{ content, isError }` |
-| `UserPromptSubmit` | `before_agent_start` | return `{ message }` to inject context |
-| `Stop` | `agent_end` | notification only |
+| `UserPromptSubmit` | `input` + `before_agent_start` | `{ action: "handled" }` to block; `{ message }` on the next event to inject context |
+| `Stop` | `agent_end` | `pi.sendMessage(…, { triggerTurn: true })` to keep the run going, capped at 8 |
 | `SessionStart` | `session_start` | inject context on the next turn |
 | `PreCompact` | `session_before_compact` | return `{ cancel: true }` |
 
@@ -247,9 +252,8 @@ match everything. This matches Claude's documented behaviour, including the cons
 Honoured JSON fields: `continue` / `stopReason` (universal, blocks the action),
 top-level `decision` + `reason` (`UserPromptSubmit`, `PostToolUse`, `PreCompact`), and
 `hookSpecificOutput.{permissionDecision, permissionDecisionReason, updatedInput, additionalContext}`
-for `PreToolUse`/`PostToolUse`/`UserPromptSubmit`/`SessionStart`. `permissionDecision: "ask"` is
-downgraded to allow-with-warning because pi's `tool_call` has no "prompt the user" return;
-`"defer"` is refused (it only exists for `claude -p` resumption).
+for `PreToolUse`/`PostToolUse`/`UserPromptSubmit`/`SessionStart`. `permissionDecision: "ask"` and
+`"defer"` are handled below under fail-closed decisions.
 
 Claude Code runs every matching handler in parallel, so this loader does too. Precedence when
 they disagree is `deny` > `ask` > `allow`, `continue: false` from any of them stops the run, and
@@ -263,8 +267,9 @@ resumption, which pi cannot do. Exit code 2 is evaluated for every handler whate
 printed, since it is the one outcome JSON cannot override.
 
 Handlers get `CLAUDE_PLUGIN_ROOT`, `CLAUDE_PLUGIN_DATA`, `CLAUDE_PROJECT_DIR` in their
-environment, run with `cwd` = the session cwd, and are cancelled at `timeout` (default 600 s,
-30 s on `UserPromptSubmit`, matching upstream). A cancelled handler renders no decision.
+environment, run under `bash` with `cwd` = the session cwd, and are cancelled at `timeout`
+(default 600 s, 30 s on `UserPromptSubmit`, matching upstream). A cancelled handler renders no
+decision.
 
 Prior art reviewed but not copied: [`hsingjui/pi-hooks`](https://github.com/hsingjui/pi-hooks).
 
@@ -408,10 +413,10 @@ on startup is a supply-chain surface we decline to add. Point `marketplaces` at 
   argument expansion including the 0-based `$N`, matcher semantics, exit-code and JSON decision
   handling, tool-name mapping round-trips.
 - **A fixture plugin** at `test/fixtures/` exercising every supported component.
-- **An end-to-end test** spawning `pi --mode rpc -e ./src/index.ts` with a second `-e`
-  extension that registers a faux provider. `pi.registerProvider(name, { streamSimple })`
-  accepts a stream function directly (`docs/custom-provider.md`), and
-  `@earendil-works/pi-ai` exports `createFauxCore()` / `fauxAssistantMessage()` /
-  `fauxToolCall()`, so the child process gets scripted model responses with no network. The
-  test drives JSONL commands over stdin and asserts that a command expands, that a hook blocks
-  a tool call, and that an agent runs.
+- **An end-to-end test** spawning `pi --mode rpc -e ./src/index.ts` with a second extension,
+  installed through the agent directory so the `pi` child an agent spawns loads it too, that
+  registers a faux provider. `pi.registerProvider()` accepts a complete pi-ai `Provider`
+  (`docs/extensions.md`), and `@earendil-works/pi-ai` exports `fauxProvider()` /
+  `fauxAssistantMessage()` / `fauxToolCall()`, so both processes get scripted model responses
+  with no network. The test drives JSONL commands over stdin and asserts that a command expands,
+  that a hook blocks a tool call, that an `ask` becomes a confirmation, and that an agent runs.
