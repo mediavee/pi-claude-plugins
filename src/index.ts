@@ -449,13 +449,12 @@ async function runSessionStartHooks(
 	pi.sendMessage({ customType: MESSAGE_TYPE, content, display: false }, { deliverAs: "nextTurn" });
 }
 
+// Only the latest copy counts: a hook whose output went A, B, then A again must resend A.
 function inActiveContext(ctx: ExtensionContext, content: string): boolean {
-	return ctx.sessionManager
+	const latest = ctx.sessionManager
 		.buildContextEntries()
-		.some(
-			(entry) =>
-				entry.type === "custom_message" && entry.customType === MESSAGE_TYPE && entry.content === content,
-		);
+		.findLast((entry) => entry.type === "custom_message" && entry.customType === MESSAGE_TYPE);
+	return latest?.type === "custom_message" && latest.content === content;
 }
 
 function registerCommands(
