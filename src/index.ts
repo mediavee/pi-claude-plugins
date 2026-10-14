@@ -274,6 +274,11 @@ export default function claudePlugins(pi: ExtensionAPI): void {
 			return { cancel: true };
 		}
 	});
+
+	// As in Claude Code, SessionStart runs again after a compaction, whose summary dropped its context.
+	pi.on("session_compact", async (_event, ctx) => {
+		await runSessionStartHooks(pi, state, ctx, "compact");
+	});
 }
 
 function announce(ctx: ExtensionContext, message: string): void {
@@ -414,11 +419,16 @@ async function runSessionStartHooks(
 	pi: ExtensionAPI,
 	state: State,
 	ctx: ExtensionContext,
-	reason: "startup" | "reload" | "new" | "resume" | "fork",
+	reason: "startup" | "reload" | "new" | "resume" | "fork" | "compact",
 ): Promise<void> {
-	const source = { startup: "startup", reload: "startup", new: "clear", resume: "resume", fork: "fork" }[
-		reason
-	];
+	const source = {
+		startup: "startup",
+		reload: "startup",
+		new: "clear",
+		resume: "resume",
+		fork: "fork",
+		compact: "compact",
+	}[reason];
 	const hooks = hooksFor(state.hooks, "SessionStart", source);
 	if (hooks.length === 0) return;
 
@@ -439,13 +449,12 @@ async function runSessionStartHooks(
 	pi.sendMessage({ customType: MESSAGE_TYPE, content, display: false }, { deliverAs: "nextTurn" });
 }
 
+// Only the latest copy counts: a hook whose output went A, B, then A again must resend A.
 function inActiveContext(ctx: ExtensionContext, content: string): boolean {
-	return ctx.sessionManager
+	const latest = ctx.sessionManager
 		.buildContextEntries()
-		.some(
-			(entry) =>
-				entry.type === "custom_message" && entry.customType === MESSAGE_TYPE && entry.content === content,
-		);
+		.findLast((entry) => entry.type === "custom_message" && entry.customType === MESSAGE_TYPE);
+	return latest?.type === "custom_message" && latest.content === content;
 }
 
 function registerCommands(

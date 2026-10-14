@@ -156,7 +156,7 @@ maps onto pi's thinking level where the names coincide. Everything refused is na
 | `PostToolUse` | `tool_result` | Append feedback, or replace the output with `updatedToolOutput` |
 | `UserPromptSubmit` | `input` | Block the prompt, or inject context |
 | `Stop` | `agent_end` | Block to keep the conversation going, capped at 8 continuations |
-| `SessionStart` | `session_start` | Inject context for the first turn, unless the same text is already in context |
+| `SessionStart` | `session_start`, `session_compact` | Inject context for the next turn, unless the same text is already in context |
 | `PreCompact` | `session_before_compact` | Block compaction |
 
 Handlers receive Claude Code's JSON on stdin, with `tool_name` in Claude's vocabulary so matchers
