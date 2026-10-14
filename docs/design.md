@@ -197,7 +197,7 @@ plugin-shipped agents upstream, and we refuse them too.
 | `PostToolUse` | `tool_result` | return a patch `{ content, isError }` |
 | `UserPromptSubmit` | `input` + `before_agent_start` | `{ action: "handled" }` to block; `{ message }` on the next event to inject context |
 | `Stop` | `agent_end` | `pi.sendMessage(…, { triggerTurn: true })` to keep the run going, capped at 8 |
-| `SessionStart` | `session_start` | inject context on the next turn |
+| `SessionStart` | `session_start`, `session_compact` (source `compact`) | inject context on the next turn |
 | `PreCompact` | `session_before_compact` | return `{ cancel: true }` |
 
 Every other Claude hook event (`PostToolUseFailure`, `Notification`, `SubagentStart`,

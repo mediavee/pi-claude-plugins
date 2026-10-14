@@ -1,5 +1,5 @@
 import { type ChildProcessWithoutNullStreams, spawn } from "node:child_process";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { REPO_ROOT } from "../helpers.ts";
@@ -14,6 +14,10 @@ export interface StartOptions {
 	pluginPaths: string[];
 	allowHooks?: boolean;
 	allowShell?: boolean;
+	/** Persists the session there instead of `--no-session`; `resume` reopens that session file. */
+	sessionDir?: string;
+	resume?: string;
+	settings?: Record<string, unknown>;
 }
 
 /**
@@ -43,7 +47,12 @@ export class RpcSession {
 
 	static start(options: StartOptions): RpcSession {
 		const agentDir = mkdtempSync(join(tmpdir(), "pcp-agent-"));
-		const workDir = mkdtempSync(join(tmpdir(), "pcp-work-"));
+		// A resumed session must start in the directory it recorded.
+		const workDir =
+			options.sessionDir === undefined
+				? mkdtempSync(join(tmpdir(), "pcp-work-"))
+				: join(options.sessionDir, "work");
+		mkdirSync(workDir, { recursive: true });
 		writeFileSync(
 			join(agentDir, "settings.json"),
 			JSON.stringify({
@@ -52,12 +61,25 @@ export class RpcSession {
 				quietStartup: true,
 				defaultProjectTrust: "never",
 				extensions: [resolve(REPO_ROOT, "test/e2e/faux-provider.ts")],
+				...options.settings,
 			}),
 		);
 
 		const child = spawn(
 			resolve(REPO_ROOT, "node_modules/.bin/pi"),
-			["--mode", "rpc", "--no-session", "-e", resolve(REPO_ROOT, "src/index.ts")],
+			[
+				"--mode",
+				"rpc",
+				...(options.sessionDir === undefined
+					? ["--no-session"]
+					: [
+							"--session-dir",
+							options.sessionDir,
+							...(options.resume === undefined ? [] : ["--session", options.resume]),
+						]),
+				"-e",
+				resolve(REPO_ROOT, "src/index.ts"),
+			],
 			{
 				cwd: workDir,
 				stdio: ["pipe", "pipe", "pipe"],
