@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- `SessionStart` context is not sent again when the same text is still in the active context, so a
+  session resumed many times no longer stacks a copy per resume.
+
 ## [0.1.0] - 2026-09-05
 
 ### Added
