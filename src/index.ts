@@ -432,10 +432,20 @@ async function runSessionStartHooks(
 
 	const context = [...decision.additionalContext, ...plainContext(executions)];
 	if (context.length === 0) return;
-	pi.sendMessage(
-		{ customType: MESSAGE_TYPE, content: context.join("\n\n"), display: false },
-		{ deliverAs: "nextTurn" },
-	);
+	const content = context.join("\n\n");
+	// A host that respawns pi per idle period resumes the same session many times: re-sending
+	// context the model still sees would stack a copy into the history at every resume.
+	if (inActiveContext(ctx, content)) return;
+	pi.sendMessage({ customType: MESSAGE_TYPE, content, display: false }, { deliverAs: "nextTurn" });
+}
+
+function inActiveContext(ctx: ExtensionContext, content: string): boolean {
+	return ctx.sessionManager
+		.buildContextEntries()
+		.some(
+			(entry) =>
+				entry.type === "custom_message" && entry.customType === MESSAGE_TYPE && entry.content === content,
+		);
 }
 
 function registerCommands(
