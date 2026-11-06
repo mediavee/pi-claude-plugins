@@ -81,10 +81,16 @@ pi does not implement Claude's `${CLAUDE_*}` substitution, so a skill body that 
 otherwise reach the model with a literal placeholder where a bundled script path belongs. Such a
 skill is served from a mirror directory: every sibling file and directory is symlinked and only
 `SKILL.md` is materialised with the placeholders expanded, so relative links and bundled assets
-still resolve. Skills without a placeholder — the overwhelming majority — are untouched. Mirrors
-live under `~/.pi/agent/claude-plugins/skills/<pid>/` so concurrent headless sessions never wipe
-each other's; a session removes its own directory at shutdown and sweeps those of dead processes
-at startup.
+still resolve. Skills without a placeholder — the overwhelming majority — are untouched. A mirror
+is content-addressed: its path is a function of the skill's directory, its sibling names and the
+expanded body, never of the process, because pi lists a skill's location in the system prompt and
+a path that changed per process would keep processes from sharing the prompt cache and re-send the
+whole skills section at every respawn. A mirror is built beside the others and renamed into place,
+an existing one is reused (its `SKILL.md` checked against the expansion) and none is ever removed,
+since another process may be reading it. Mirrors live under `PI_CLAUDE_PLUGINS_STAGING`, else
+`<agent dir>/claude-plugins/skills/`; a host that makes the agent dir read-only points the variable
+at a directory pi may write. When no mirror can be written the skill is still listed from its own
+directory, unexpanded, and the load report says so.
 
 A plugin-root `SKILL.md` is loaded only when there is no `skills/` directory and no manifest
 `skills` field, matching Claude Code's single-skill-plugin rule, and it goes through the same
@@ -347,6 +353,7 @@ Environment overrides, for headless and container use:
 | `PI_CLAUDE_PLUGINS_MARKETPLACES` | `PATH`-separated marketplace directories |
 | `PI_CLAUDE_PLUGINS_ALLOW_HOOKS` | `1`/`true` sets `allowHooks` |
 | `PI_CLAUDE_PLUGINS_ALLOW_SHELL` | `1`/`true` sets `allowShellCommands` |
+| `PI_CLAUDE_PLUGINS_STAGING` | Directory for the mirrors of skills that use `${CLAUDE_*}` |
 
 ## 4. Security model
 

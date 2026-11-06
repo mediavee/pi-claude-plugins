@@ -1,9 +1,12 @@
+import { createHash } from "node:crypto";
 import {
 	type Dirent,
 	existsSync,
 	mkdirSync,
+	mkdtempSync,
 	readdirSync,
 	readFileSync,
+	renameSync,
 	rmSync,
 	symlinkSync,
 	writeFileSync,
@@ -106,55 +109,75 @@ function findSkillFiles(dir: string, depth: number): string[] {
  *
  * The mirror symlinks every sibling file and directory so relative links and bundled scripts
  * still resolve; only `SKILL.md` is materialised, with the placeholders expanded.
+ *
+ * The mirror is content-addressed: its path is a function of the skill's directory, its sibling
+ * names and the expanded body, never of the process. Pi lists a skill's location in the system
+ * prompt, so a path that changed per process would stop every process from sharing the prompt
+ * cache and re-send the whole skills section at each respawn. A mirror is built beside the
+ * others and renamed into place, so a reader never sees it half written, and an existing one is
+ * reused and never removed: another process may be reading it.
+ *
+ * It falls back to the skill's own directory, and reports why through `onFailure`, when no
+ * mirror can be written (a read-only root): the skill is still listed, only its placeholders
+ * stay unexpanded.
  */
-export function materialiseSkill(skill: SkillSource, stagingRoot: string, vars: SubstitutionVars): string {
-	const target = join(stagingRoot, skill.plugin.replace(/[^\w-]+/g, "-"), skill.name);
+export function materialiseSkill(
+	skill: SkillSource,
+	stagingRoot: string,
+	vars: SubstitutionVars,
+	onFailure?: (error: unknown) => void,
+): string {
 	try {
-		rmSync(target, { recursive: true, force: true });
-		mkdirSync(target, { recursive: true });
+		const body = substituteClaudeVars(readFileSync(join(skill.path, SKILL_FILE), "utf8"), vars);
+		const siblings = readdirSync(skill.path)
+			.filter((name) => name !== SKILL_FILE)
+			.sort();
+		const key = createHash("sha256")
+			.update(JSON.stringify([skill.path, siblings, body]))
+			.digest("hex")
+			.slice(0, 16);
+		const slot = join(stagingRoot, key);
+		const dirName = skill.name.replace(/[^\w-]+/g, "-");
+		const target = join(slot, dirName);
+		if (isMirrorOf(target, body)) return target;
 
-		for (const entry of readdirSync(skill.path, { withFileTypes: true })) {
-			if (entry.name === SKILL_FILE) continue;
-			try {
-				symlinkSync(join(skill.path, entry.name), join(target, entry.name));
-			} catch {
-				// A sibling we cannot link is simply absent from the mirror.
+		mkdirSync(stagingRoot, { recursive: true });
+		const scratch = mkdtempSync(join(stagingRoot, ".tmp-"));
+		try {
+			const built = join(scratch, dirName);
+			mkdirSync(built);
+			for (const name of siblings) {
+				try {
+					symlinkSync(join(skill.path, name), join(built, name));
+				} catch {
+					// A sibling we cannot link is simply absent from the mirror.
+				}
 			}
+			writeFileSync(join(built, SKILL_FILE), body, "utf8");
+			try {
+				renameSync(scratch, slot);
+			} catch {
+				// Another process renamed the same content first, or something else sits at
+				// the slot; only a copy that is not what we would have written is replaced.
+				if (isMirrorOf(target, body)) return target;
+				rmSync(slot, { recursive: true, force: true });
+				renameSync(scratch, slot);
+			}
+		} finally {
+			rmSync(scratch, { recursive: true, force: true });
 		}
-
-		const body = readFileSync(join(skill.path, SKILL_FILE), "utf8");
-		writeFileSync(join(target, SKILL_FILE), substituteClaudeVars(body, vars), "utf8");
 		return target;
-	} catch {
+	} catch (error) {
+		onFailure?.(error);
 		return skill.path;
 	}
 }
 
-/**
- * Removes staging directories left behind by pi processes that are no longer running. Each
- * session stages under its own pid so concurrent sessions never wipe each other's mirrors.
- */
-export function sweepStaleStaging(stagingParent: string): void {
-	let entries: Dirent[];
+function isMirrorOf(target: string, body: string): boolean {
 	try {
-		entries = readdirSync(stagingParent, { withFileTypes: true });
+		return readFileSync(join(target, SKILL_FILE), "utf8") === body;
 	} catch {
-		return;
-	}
-	for (const entry of entries) {
-		if (!entry.isDirectory() || !/^\d+$/.test(entry.name)) continue;
-		const pid = Number(entry.name);
-		if (pid === process.pid || isRunning(pid)) continue;
-		rmSync(join(stagingParent, entry.name), { recursive: true, force: true });
-	}
-}
-
-function isRunning(pid: number): boolean {
-	try {
-		process.kill(pid, 0);
-		return true;
-	} catch (error) {
-		return (error as NodeJS.ErrnoException).code === "EPERM";
+		return false;
 	}
 }
 

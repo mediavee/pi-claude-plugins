@@ -18,6 +18,9 @@ export interface StartOptions {
 	sessionDir?: string;
 	resume?: string;
 	settings?: Record<string, unknown>;
+	/** Runs on the fresh agent dir before pi starts, to leave state behind in it. */
+	prepareAgentDir?: (agentDir: string) => void;
+	env?: Record<string, string>;
 }
 
 /**
@@ -65,6 +68,8 @@ export class RpcSession {
 			}),
 		);
 
+		options.prepareAgentDir?.(agentDir);
+
 		const child = spawn(
 			resolve(REPO_ROOT, "node_modules/.bin/pi"),
 			[
@@ -91,6 +96,7 @@ export class RpcSession {
 					PI_CLAUDE_PLUGINS: options.pluginPaths.join(":"),
 					PI_CLAUDE_PLUGINS_ALLOW_HOOKS: options.allowHooks ? "1" : "0",
 					PI_CLAUDE_PLUGINS_ALLOW_SHELL: options.allowShell ? "1" : "0",
+					...options.env,
 				},
 			},
 		) as ChildProcessWithoutNullStreams;
@@ -178,6 +184,11 @@ export class RpcSession {
 
 	toolResults(toolName: string): RpcEvent[] {
 		return this.events.filter((event) => event.type === "tool_execution_end" && event.toolName === toolName);
+	}
+
+	/** The agent dir pi runs on. */
+	get agentDirPath(): string {
+		return this.agentDir;
 	}
 
 	async stop(): Promise<void> {

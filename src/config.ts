@@ -148,6 +148,15 @@ export function resolveSettings(options: ResolveSettingsOptions): PluginSettings
 }
 
 /**
+ * Where skills that use `${CLAUDE_*}` placeholders are mirrored. A host that confines pi
+ * points it at a directory the engine may write; unset, it is a directory of the agent dir.
+ */
+export function resolveStagingRoot(agentDir: string, env: NodeJS.ProcessEnv = process.env): string {
+	const declared = env.PI_CLAUDE_PLUGINS_STAGING?.trim();
+	return declared ? resolve(expandHome(declared)) : resolve(agentDir, "claude-plugins", "skills");
+}
+
+/**
  * Trust is keyed on the origin-qualified id so a marketplace cannot inherit another plugin's
  * grant by reusing its bare name. A directory-sourced plugin's id is already its bare name.
  */
