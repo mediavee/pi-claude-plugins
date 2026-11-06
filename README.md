@@ -66,6 +66,8 @@ For headless and container use, the environment wins over settings:
 | `PI_CLAUDE_PLUGINS_ENABLED` | Comma-separated marketplace entries to enable |
 | `PI_CLAUDE_PLUGINS_ALLOW_HOOKS` | `1`/`true` enables hooks |
 | `PI_CLAUDE_PLUGINS_ALLOW_SHELL` | `1`/`true` enables `!` expansion |
+| `PI_CLAUDE_PLUGINS_STAGING` | Writable directory for skill mirrors (default `<agent dir>/claude-plugins/skills`) |
+| `PI_CLAUDE_PLUGINS_INVENTORY` | File to write the discovered skills' names to, as `{"skills": [...]}` |
 
 ```bash
 PI_CLAUDE_PLUGINS=/srv/plugins/acme pi --mode rpc
@@ -94,7 +96,8 @@ directory and declares no manifest `skills` field, as upstream.
 
 pi does not understand `${CLAUDE_*}` placeholders. A skill whose body uses one is served from a
 mirror directory where the siblings are symlinked and only `SKILL.md` is rewritten, so bundled
-script paths resolve while relative links keep working.
+script paths resolve while relative links keep working. The mirror's path depends only on the
+content, so every process of a host serves the same one.
 
 Claude Code namespaces plugin skills as `/plugin:skill`. pi skill names are limited to
 `[a-z0-9-]`, so the colon form cannot be reproduced and skills keep their own names. If two

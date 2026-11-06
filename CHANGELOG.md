@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Skills that use `${CLAUDE_*}` are mirrored at a path that depends on their content, not on the
+  process, so processes share one system prompt. Nothing is removed at session start or shutdown:
+  a leftover directory an agent dir does not let the session delete no longer stops every skill from
+  loading, and a mirror that cannot be written leaves the skill listed from its own directory with a
+  warning. A mirror with a wrong `SKILL.md` or side link is repaired entry by entry, never deleted.
+  `PI_CLAUDE_PLUGINS_STAGING` sets where mirrors are written, `PI_CLAUDE_PLUGINS_INVENTORY` where the
+  names of the discovered skills are written.
 - `SessionStart` context is not sent again when its latest copy in the active context is the same
   text, so a session resumed many times no longer stacks a copy per resume.
 - `SessionStart` hooks run again after a compaction, with source `compact`, as upstream: the summary

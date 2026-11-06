@@ -1,11 +1,11 @@
 import { spawn } from "node:child_process";
-import { mkdirSync, rmSync } from "node:fs";
-import { dirname, resolve } from "node:path";
+import { mkdirSync } from "node:fs";
+import { resolve } from "node:path";
 import { type ExtensionAPI, type ExtensionContext, getAgentDir } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { resolveAgent, runAgent } from "./agents.ts";
 import { expandCommand } from "./commands.ts";
-import { resolveSettings } from "./config.ts";
+import { resolveInventoryPath, resolveSettings, resolveStagingRoot } from "./config.ts";
 import { loadPlugins } from "./discovery.ts";
 import {
 	type HookDecision,
@@ -19,9 +19,9 @@ import {
 } from "./hooks.ts";
 import { type McpRegistration, registerMcpServer } from "./mcp.ts";
 import { formatReport } from "./report.ts";
-import { materialiseSkill, sweepStaleStaging } from "./skills.ts";
+import { materialiseSkill, writeInventory } from "./skills.ts";
 import { claudeInputToPi, piInputToClaude, piToolToClaude } from "./tool-names.ts";
-import type { LoadedPlugin, PluginAgent, PluginHook, SubstitutionVars } from "./types.ts";
+import type { Diagnostic, LoadedPlugin, PluginAgent, PluginHook, SubstitutionVars } from "./types.ts";
 
 const AGENT_TOOL = "claude_plugin_agent";
 const MESSAGE_TYPE = "claude-plugins";
@@ -79,16 +79,25 @@ export default function claudePlugins(pi: ExtensionAPI): void {
 			projectTrusted: ctx.isProjectTrusted(),
 		});
 		state.dataRoot = resolve(agentDir, "claude-plugins", "data");
-		// Staged per process: concurrent headless sessions must not wipe each other's mirrors.
-		state.stagingRoot = resolve(agentDir, "claude-plugins", "skills", String(process.pid));
-		sweepStaleStaging(dirname(state.stagingRoot));
-		rmSync(state.stagingRoot, { recursive: true, force: true });
+		state.stagingRoot = resolveStagingRoot(agentDir);
 
 		const result = loadPlugins({ settings, cwd: ctx.cwd, dataRoot: state.dataRoot });
 		state.plugins = result.plugins;
 		state.hooks = result.plugins.flatMap((plugin) => plugin.hooks);
 		state.agents = result.plugins.flatMap((plugin) => plugin.agents);
-		state.skillPaths = resolveSkillPaths(state, ctx);
+		state.skillPaths = resolveSkillPaths(state, ctx, result.diagnostics);
+		const inventory = resolveInventoryPath();
+		if (inventory) {
+			try {
+				writeInventory(inventory, result.plugins);
+			} catch (error) {
+				result.diagnostics.push({
+					level: "warn",
+					plugin: "claude-plugins",
+					message: `cannot write the skill inventory to ${inventory}: ${(error as Error).message}`,
+				});
+			}
+		}
 
 		registerCommands(pi, state, settings.allowShellCommands, ctx);
 		registerAgentTool(pi, state);
@@ -110,7 +119,6 @@ export default function claudePlugins(pi: ExtensionAPI): void {
 		const registrations = state.registrations;
 		state.registrations = [];
 		await Promise.all(registrations.map((registration) => registration.dispose().catch(() => {})));
-		if (state.stagingRoot) rmSync(state.stagingRoot, { recursive: true, force: true });
 	});
 
 	pi.on("resources_discover", () => ({ skillPaths: state.skillPaths }));
@@ -289,7 +297,7 @@ function announce(ctx: ExtensionContext, message: string): void {
 }
 
 /** pi cannot expand `${CLAUDE_*}`, so a skill that uses one is served from a rewritten mirror. */
-function resolveSkillPaths(state: State, ctx: ExtensionContext): string[] {
+function resolveSkillPaths(state: State, ctx: ExtensionContext, diagnostics: Diagnostic[]): string[] {
 	const paths: string[] = [];
 	for (const plugin of state.plugins) {
 		for (const skill of plugin.skills) {
@@ -303,7 +311,15 @@ function resolveSkillPaths(state: State, ctx: ExtensionContext): string[] {
 				CLAUDE_PROJECT_DIR: ctx.cwd,
 				CLAUDE_SKILL_DIR: skill.path,
 			};
-			paths.push(materialiseSkill(skill, state.stagingRoot, vars));
+			paths.push(
+				materialiseSkill(skill, state.stagingRoot, vars, (error) =>
+					diagnostics.push({
+						level: "warn",
+						plugin: plugin.id,
+						message: `skill ${skill.name} is served with its placeholders unexpanded: ${(error as Error).message}`,
+					}),
+				),
+			);
 		}
 	}
 	return paths;
