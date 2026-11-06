@@ -86,11 +86,14 @@ is content-addressed: its path is a function of the skill's directory, its sibli
 expanded body, never of the process, because pi lists a skill's location in the system prompt and
 a path that changed per process would keep processes from sharing the prompt cache and re-send the
 whole skills section at every respawn. A mirror is built beside the others and renamed into place,
-an existing one is reused (its `SKILL.md` checked against the expansion) and none is ever removed,
-since another process may be reading it. Mirrors live under `PI_CLAUDE_PLUGINS_STAGING`, else
+an existing one is reused once its `SKILL.md` and every side link are checked, and none is ever
+removed, since another process may be reading it: a wrong entry is replaced by renaming a new one
+over it. Mirrors live under `PI_CLAUDE_PLUGINS_STAGING`, else
 `<agent dir>/claude-plugins/skills/`; a host that makes the agent dir read-only points the variable
 at a directory pi may write. When no mirror can be written the skill is still listed from its own
-directory, unexpanded, and the load report says so.
+directory, unexpanded, and the load report says so. A host that confines pi and cannot tell a skill
+that never loaded from one that does not exist sets `PI_CLAUDE_PLUGINS_INVENTORY`: the names pi is
+handed are written there from the same discovery.
 
 A plugin-root `SKILL.md` is loaded only when there is no `skills/` directory and no manifest
 `skills` field, matching Claude Code's single-skill-plugin rule, and it goes through the same
@@ -354,6 +357,7 @@ Environment overrides, for headless and container use:
 | `PI_CLAUDE_PLUGINS_ALLOW_HOOKS` | `1`/`true` sets `allowHooks` |
 | `PI_CLAUDE_PLUGINS_ALLOW_SHELL` | `1`/`true` sets `allowShellCommands` |
 | `PI_CLAUDE_PLUGINS_STAGING` | Directory for the mirrors of skills that use `${CLAUDE_*}` |
+| `PI_CLAUDE_PLUGINS_INVENTORY` | File the names of the discovered skills are written to, as `{"skills": [...]}` |
 
 ## 4. Security model
 

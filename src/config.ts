@@ -156,6 +156,12 @@ export function resolveStagingRoot(agentDir: string, env: NodeJS.ProcessEnv = pr
 	return declared ? resolve(expandHome(declared)) : resolve(agentDir, "claude-plugins", "skills");
 }
 
+/** Where the host wants the inventory of what was discovered written, if it does. */
+export function resolveInventoryPath(env: NodeJS.ProcessEnv = process.env): string | undefined {
+	const declared = env.PI_CLAUDE_PLUGINS_INVENTORY?.trim();
+	return declared ? resolve(expandHome(declared)) : undefined;
+}
+
 /**
  * Trust is keyed on the origin-qualified id so a marketplace cannot inherit another plugin's
  * grant by reusing its bare name. A directory-sourced plugin's id is already its bare name.

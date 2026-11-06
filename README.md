@@ -67,6 +67,7 @@ For headless and container use, the environment wins over settings:
 | `PI_CLAUDE_PLUGINS_ALLOW_HOOKS` | `1`/`true` enables hooks |
 | `PI_CLAUDE_PLUGINS_ALLOW_SHELL` | `1`/`true` enables `!` expansion |
 | `PI_CLAUDE_PLUGINS_STAGING` | Writable directory for skill mirrors (default `<agent dir>/claude-plugins/skills`) |
+| `PI_CLAUDE_PLUGINS_INVENTORY` | File to write the discovered skills' names to, as `{"skills": [...]}` |
 
 ```bash
 PI_CLAUDE_PLUGINS=/srv/plugins/acme pi --mode rpc

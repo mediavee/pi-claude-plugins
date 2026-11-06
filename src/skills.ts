@@ -1,11 +1,13 @@
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import {
 	type Dirent,
 	existsSync,
+	lstatSync,
 	mkdirSync,
 	mkdtempSync,
 	readdirSync,
 	readFileSync,
+	readlinkSync,
 	renameSync,
 	rmSync,
 	symlinkSync,
@@ -15,7 +17,7 @@ import { basename, dirname, join, resolve } from "node:path";
 import { parseFrontmatter } from "@earendil-works/pi-coding-agent";
 import { isDirectory, isInside, resolveComponentPaths } from "./manifest.ts";
 import { substituteClaudeVars } from "./substitute.ts";
-import type { PluginManifest, SkillSource, SubstitutionVars } from "./types.ts";
+import type { LoadedPlugin, PluginManifest, SkillSource, SubstitutionVars } from "./types.ts";
 
 const SKILL_FILE = "SKILL.md";
 const MAX_DEPTH = 8;
@@ -114,8 +116,10 @@ function findSkillFiles(dir: string, depth: number): string[] {
  * names and the expanded body, never of the process. Pi lists a skill's location in the system
  * prompt, so a path that changed per process would stop every process from sharing the prompt
  * cache and re-send the whole skills section at each respawn. A mirror is built beside the
- * others and renamed into place, so a reader never sees it half written, and an existing one is
- * reused and never removed: another process may be reading it.
+ * others and renamed into place, so a reader never sees it half written. One that is in place
+ * is never removed, whatever state it is in: another process may be reading it. A mirror whose
+ * `SKILL.md` or links are not what we would write is repaired entry by entry, each entry
+ * replaced by renaming a new one over it, so a reader finds the old entry or the new one.
  *
  * It falls back to the skill's own directory, and reports why through `onFailure`, when no
  * mirror can be written (a read-only root): the skill is still listed, only its placeholders
@@ -139,29 +143,23 @@ export function materialiseSkill(
 		const slot = join(stagingRoot, key);
 		const dirName = skill.name.replace(/[^\w-]+/g, "-");
 		const target = join(slot, dirName);
-		if (isMirrorOf(target, body)) return target;
+		const expected = { source: skill.path, siblings, body };
+		if (isMirrorOf(target, expected)) return target;
 
 		mkdirSync(stagingRoot, { recursive: true });
 		const scratch = mkdtempSync(join(stagingRoot, ".tmp-"));
 		try {
 			const built = join(scratch, dirName);
 			mkdirSync(built);
-			for (const name of siblings) {
-				try {
-					symlinkSync(join(skill.path, name), join(built, name));
-				} catch {
-					// A sibling we cannot link is simply absent from the mirror.
-				}
-			}
+			for (const name of siblings) symlinkSync(join(skill.path, name), join(built, name));
 			writeFileSync(join(built, SKILL_FILE), body, "utf8");
 			try {
 				renameSync(scratch, slot);
 			} catch {
 				// Another process renamed the same content first, or something else sits at
-				// the slot; only a copy that is not what we would have written is replaced.
-				if (isMirrorOf(target, body)) return target;
-				rmSync(slot, { recursive: true, force: true });
-				renameSync(scratch, slot);
+				// the slot: what is there is completed in place, never replaced as a whole.
+				if (isMirrorOf(target, expected)) return target;
+				repairMirror(target, expected);
 			}
 		} finally {
 			rmSync(scratch, { recursive: true, force: true });
@@ -173,11 +171,80 @@ export function materialiseSkill(
 	}
 }
 
-function isMirrorOf(target: string, body: string): boolean {
+interface ExpectedMirror {
+	source: string;
+	siblings: readonly string[];
+	body: string;
+}
+
+/** Whether *target* is a real directory holding the expansion and a link to every sibling. */
+function isMirrorOf(target: string, expected: ExpectedMirror): boolean {
 	try {
-		return readFileSync(join(target, SKILL_FILE), "utf8") === body;
+		if (!lstatSync(target).isDirectory()) return false;
+		return (
+			isFileWith(join(target, SKILL_FILE), expected.body) &&
+			expected.siblings.every((name) => isLinkTo(join(target, name), expected.source, name))
+		);
 	} catch {
 		return false;
+	}
+}
+
+/**
+ * Brings the mirror at *target* to what a new one would hold, entry by entry. Each wrong or
+ * missing entry is made beside the old one and renamed over it, which replaces a file or a link
+ * atomically on POSIX: a reader that already has the mirror's path never finds it gone.
+ * A *target* that is not a real directory is refused, since writing into a link would write
+ * wherever it leads.
+ */
+function repairMirror(target: string, expected: ExpectedMirror): void {
+	mkdirSync(target, { recursive: true });
+	if (!lstatSync(target).isDirectory()) throw new Error(`${target} is not a directory`);
+	const replacement = join(target, `.new-${process.pid}-${randomUUID()}`);
+	try {
+		if (!isFileWith(join(target, SKILL_FILE), expected.body)) {
+			writeFileSync(replacement, expected.body, "utf8");
+			renameSync(replacement, join(target, SKILL_FILE));
+		}
+		for (const name of expected.siblings) {
+			if (isLinkTo(join(target, name), expected.source, name)) continue;
+			symlinkSync(join(expected.source, name), replacement);
+			renameSync(replacement, join(target, name));
+		}
+	} finally {
+		rmSync(replacement, { force: true });
+	}
+}
+
+function isFileWith(path: string, body: string): boolean {
+	try {
+		return lstatSync(path).isFile() && readFileSync(path, "utf8") === body;
+	} catch {
+		return false;
+	}
+}
+
+function isLinkTo(path: string, source: string, name: string): boolean {
+	try {
+		return lstatSync(path).isSymbolicLink() && readlinkSync(path) === join(source, name);
+	} catch {
+		return false;
+	}
+}
+
+/**
+ * The skills pi is handed, by the name it lists them under, written for a host that confines pi
+ * and cannot otherwise tell a skill that never loaded from one that does not exist. Written
+ * from the same discovery that feeds pi, and renamed into place so a reader never sees half.
+ */
+export function writeInventory(path: string, plugins: readonly LoadedPlugin[]): void {
+	const names = [...new Set(plugins.flatMap((plugin) => plugin.skills.map((skill) => skill.name)))].sort();
+	const scratch = `${path}.${process.pid}.tmp`;
+	try {
+		writeFileSync(scratch, `${JSON.stringify({ skills: names })}\n`, "utf8");
+		renameSync(scratch, path);
+	} finally {
+		rmSync(scratch, { force: true });
 	}
 }
 

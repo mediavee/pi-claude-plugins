@@ -10,14 +10,14 @@ interface Command {
 }
 
 /** The `runner` skill's commands: other skills of the user's machine may be listed beside it. */
-async function runnerSkills(session: RpcSession): Promise<Command[]> {
+async function runnerSkills(session: RpcSession, names = ["skill:runner"]): Promise<Command[]> {
 	session.send({ id: "cmds", type: "get_commands" });
 	const response = await session.waitFor(
 		(event) => event.type === "response" && event.command === "get_commands",
 		{ timeoutMs: 40_000 },
 	);
 	const commands = (response.data as { commands: Command[] }).commands;
-	return commands.filter((command) => command.name === "skill:runner");
+	return commands.filter((command) => names.includes(command.name));
 }
 
 function pluginWithPlaceholderSkill(): string {
@@ -30,6 +30,17 @@ function pluginWithPlaceholderSkill(): string {
 		"---\nname: runner\ndescription: Runs the bundled script.\n---\nRun ${CLAUDE_SKILL_DIR}/run.sh",
 	);
 	writeFileSync(join(root, "skills/runner/run.sh"), "#!/bin/sh\n");
+	return root;
+}
+
+function pluginWithRootSkill(): string {
+	const root = mkdtempSync(join(tmpdir(), "pcp-solo-"));
+	mkdirSync(join(root, ".claude-plugin"));
+	writeFileSync(join(root, ".claude-plugin/plugin.json"), JSON.stringify({ name: "solo-demo" }));
+	writeFileSync(
+		join(root, "SKILL.md"),
+		"---\nname: solo\ndescription: A plugin that is one skill.\n---\nBody",
+	);
 	return root;
 }
 
@@ -102,5 +113,28 @@ describe("skills of a pi whose agent dir it cannot write", () => {
 
 		expect(paths[0]).toBeDefined();
 		expect(paths[1]).toBe(paths[0]);
+	}, 120_000);
+
+	it("writes the skills it hands pi, root and nested ones, where the host asks", async () => {
+		const plugins = [pluginWithPlaceholderSkill(), pluginWithRootSkill()];
+		const out = mkdtempSync(join(tmpdir(), "pcp-inventory-"));
+		cleanups.push(() => {
+			for (const plugin of plugins) rmSync(plugin, { recursive: true, force: true });
+			rmSync(out, { recursive: true, force: true });
+		});
+		const inventory = join(out, "inventory.json");
+		const session = RpcSession.start({
+			pluginPaths: plugins,
+			env: { PI_CLAUDE_PLUGINS_INVENTORY: inventory },
+		});
+		try {
+			const listed = await runnerSkills(session, ["skill:runner", "skill:solo"]);
+
+			const written = JSON.parse(readFileSync(inventory, "utf8")) as { skills: string[] };
+			expect(written.skills).toEqual(["runner", "solo"]);
+			expect(listed.map((command) => command.name).sort()).toEqual(["skill:runner", "skill:solo"]);
+		} finally {
+			await session.stop();
+		}
 	}, 120_000);
 });

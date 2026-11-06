@@ -5,7 +5,7 @@ import { type ExtensionAPI, type ExtensionContext, getAgentDir } from "@earendil
 import { Type } from "typebox";
 import { resolveAgent, runAgent } from "./agents.ts";
 import { expandCommand } from "./commands.ts";
-import { resolveSettings, resolveStagingRoot } from "./config.ts";
+import { resolveInventoryPath, resolveSettings, resolveStagingRoot } from "./config.ts";
 import { loadPlugins } from "./discovery.ts";
 import {
 	type HookDecision,
@@ -19,7 +19,7 @@ import {
 } from "./hooks.ts";
 import { type McpRegistration, registerMcpServer } from "./mcp.ts";
 import { formatReport } from "./report.ts";
-import { materialiseSkill } from "./skills.ts";
+import { materialiseSkill, writeInventory } from "./skills.ts";
 import { claudeInputToPi, piInputToClaude, piToolToClaude } from "./tool-names.ts";
 import type { Diagnostic, LoadedPlugin, PluginAgent, PluginHook, SubstitutionVars } from "./types.ts";
 
@@ -86,6 +86,18 @@ export default function claudePlugins(pi: ExtensionAPI): void {
 		state.hooks = result.plugins.flatMap((plugin) => plugin.hooks);
 		state.agents = result.plugins.flatMap((plugin) => plugin.agents);
 		state.skillPaths = resolveSkillPaths(state, ctx, result.diagnostics);
+		const inventory = resolveInventoryPath();
+		if (inventory) {
+			try {
+				writeInventory(inventory, result.plugins);
+			} catch (error) {
+				result.diagnostics.push({
+					level: "warn",
+					plugin: "claude-plugins",
+					message: `cannot write the skill inventory to ${inventory}: ${(error as Error).message}`,
+				});
+			}
+		}
 
 		registerCommands(pi, state, settings.allowShellCommands, ctx);
 		registerAgentTool(pi, state);
