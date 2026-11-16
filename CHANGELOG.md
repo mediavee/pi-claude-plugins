@@ -9,6 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `allowHooks` no longer runs `` !`command` `` expansions. Shell expansion stays behind
+  `allowShellCommands` or `trustedPlugins`.
+- A command hook with `"async": true` runs in the background. It does not block the action, its
+  decision fields are ignored, and `timeout` is not enforced. `additionalContext` and
+  `systemMessage` are delivered on a later turn.
+- `"onFailure": "block"` treats a missing executable, an exit other than 0 or 2, unparseable
+  `{...}` stdout and a timeout like exit 2. It has no effect on `Stop` or on an async hook.
+- A Bash `if` pattern that names more than the command runs the hook when the line contains
+  `$(…)`, backticks or `$VAR`.
+- `${CLAUDE_PLUGIN_DATA}` is one directory for a `name@marketplace` plugin in load-time
+  substitution, hook environment and child agent environment.
+- `PreCompact` ignores `continue`, so `continue: false` no longer cancels compaction.
 - Skills that use `${CLAUDE_*}` are mirrored at a path that depends on their content, not on the
   process, so processes share one system prompt. Nothing is removed at session start or shutdown:
   a leftover directory an agent dir does not let the session delete no longer stops every skill from
@@ -20,6 +32,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   text, so a session resumed many times no longer stacks a copy per resume.
 - `SessionStart` hooks run again after a compaction, with source `compact`, as upstream: the summary
   had dropped their context until the next session start.
+
+### Changed
+
+- The startup report names loader limits a loaded plugin can hit: Stop `additionalContext` and the
+  continuation count, `UserPromptSubmit` on plugin commands, `CLAUDE_ENV_FILE`, plugin MCP names,
+  and PreCompact stdout as summary instructions. pi 0.84.4 cannot pass that stdout to the default
+  summarizer.
 
 ## [0.1.0] - 2026-09-05
 

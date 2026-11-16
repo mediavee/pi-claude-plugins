@@ -26,6 +26,19 @@ export interface LoadResult {
 	available: string[];
 }
 
+/** Directory for `${CLAUDE_PLUGIN_DATA}`. `@` in a marketplace id becomes `-`, once for every caller. */
+export function pluginDataDirectory(dataRoot: string, pluginId: string): string {
+	return resolve(dataRoot, pluginId.replace(/[^\w-]+/g, "-"));
+}
+
+/**
+ * Data directories key on the origin-qualified id. Hooks and agents store the bare name,
+ * which is a different directory for `name@marketplace`.
+ */
+export function pluginDataId(plugins: readonly { id: string; name: string }[], key: string): string {
+	return plugins.find((plugin) => plugin.id === key || plugin.name === key)?.id ?? key;
+}
+
 export function loadPlugins(options: LoadOptions): LoadResult {
 	const diagnostics: Diagnostic[] = [];
 	const available: string[] = [];
@@ -128,7 +141,7 @@ function loadPlugin(
 
 	const vars: SubstitutionVars = {
 		CLAUDE_PLUGIN_ROOT: candidate.root,
-		CLAUDE_PLUGIN_DATA: resolve(options.dataRoot, id.replace(/[^\w-]+/g, "-")),
+		CLAUDE_PLUGIN_DATA: pluginDataDirectory(options.dataRoot, id),
 		CLAUDE_PROJECT_DIR: options.cwd,
 	};
 
@@ -150,12 +163,15 @@ function loadPlugin(
 	escaped.push(...agents.escaped);
 	for (const warning of agents.warnings) warn(warning);
 
-	const trusted = isPluginTrusted(options.settings, id, options.settings.allowHooks);
+	// `trusted` is the trustedPlugins grant only. allowHooks must not flip it: index.ts
+	// reads it as permission to expand !`command`.
+	const trusted = isPluginTrusted(options.settings, id, false);
+	const hooksAllowed = isPluginTrusted(options.settings, id, options.settings.allowHooks);
 	const hooks = discoverHooks(name, candidate.root, manifest, vars);
 	escaped.push(...hooks.escaped);
 	for (const warning of hooks.warnings) warn(warning);
-	if (!trusted && hooks.hooks.length > 0) {
-		refused.push(`${hooks.hooks.length} hook handler(s): not trusted to run shell commands`);
+	if (!hooksAllowed && hooks.hooks.length > 0) {
+		refused.push(`${hooks.hooks.length} hook handler(s): hooks stay off until allowHooks or trustedPlugins`);
 	}
 
 	const mcp = discoverMcpServers(name, candidate.root, manifest, vars, options.env);
@@ -176,7 +192,7 @@ function loadPlugin(
 		skills: skills.skills,
 		commands: commands.commands,
 		agents: agents.agents,
-		hooks: trusted ? hooks.hooks : [],
+		hooks: hooksAllowed ? hooks.hooks : [],
 		mcpServers: mcp.servers,
 		unsupportedHooks: hooks.unsupported,
 		refused,

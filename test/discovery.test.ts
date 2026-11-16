@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { expandHome, resolveSettings } from "../src/config.ts";
-import { loadPlugins } from "../src/discovery.ts";
+import { loadPlugins, pluginDataDirectory, pluginDataId } from "../src/discovery.ts";
 import { formatReport } from "../src/report.ts";
 import { findSkillCollisions } from "../src/skills.ts";
 import type { PluginSettings } from "../src/types.ts";
@@ -56,6 +56,59 @@ describe("loadPlugins", () => {
 			...loadOptions,
 		});
 		expect(global.plugins[0]?.hooks).toHaveLength(4);
+		expect(global.plugins[0]?.trusted).toBe(false);
+		const report = formatReport({
+			plugins: global.plugins,
+			diagnostics: [],
+			collisions: [],
+			mcpUnavailable: [],
+			available: [],
+		});
+		expect(report).toContain("shell expansion in commands is disabled");
+	});
+
+	it("uses one data directory for a marketplace plugin at load time and at runtime", () => {
+		const root = mkdtempSync(join(tmpdir(), "pcp-market-"));
+		try {
+			const pluginRoot = join(root, "plugins", "formatter");
+			mkdirSync(join(pluginRoot, ".claude-plugin"), { recursive: true });
+			mkdirSync(join(pluginRoot, "hooks"), { recursive: true });
+			writeFileSync(join(pluginRoot, ".claude-plugin/plugin.json"), JSON.stringify({ name: "formatter" }));
+			writeFileSync(
+				join(pluginRoot, "hooks/hooks.json"),
+				JSON.stringify({
+					hooks: {
+						SessionStart: [{ hooks: [{ type: "command", command: "echo ${CLAUDE_PLUGIN_DATA}" }] }],
+					},
+				}),
+			);
+			mkdirSync(join(root, ".claude-plugin"), { recursive: true });
+			writeFileSync(
+				join(root, ".claude-plugin/marketplace.json"),
+				JSON.stringify({
+					name: "acme",
+					plugins: [{ name: "formatter", source: "./plugins/formatter" }],
+				}),
+			);
+
+			const result = loadPlugins({
+				settings: settings({
+					marketplaces: [root],
+					enabledPlugins: ["formatter@acme"],
+					allowHooks: true,
+				}),
+				cwd: "/work",
+				dataRoot: "/data",
+			});
+			const plugin = result.plugins[0];
+			const expected = pluginDataDirectory("/data", "formatter@acme");
+			expect(plugin?.id).toBe("formatter@acme");
+			expect(plugin?.hooks[0]?.handler.command).toContain(expected);
+			expect(pluginDataDirectory("/data", pluginDataId(result.plugins, "formatter"))).toBe(expected);
+			expect(pluginDataDirectory("/data", "formatter")).not.toBe(expected);
+		} finally {
+			rmSync(root, { recursive: true, force: true });
+		}
 	});
 
 	it("maps Claude agent tool names onto pi's", () => {
@@ -186,6 +239,47 @@ describe("formatReport", () => {
 		expect(report).toContain("shell expansion in commands is disabled");
 		expect(report).toContain("available but not enabled");
 		expect(report).toContain("pi-mcp-adapter");
+		expect(report).toContain("mcp__plugin_");
+	});
+
+	it("names the loader limits of the hooks that actually loaded", () => {
+		const result = loadPlugins({
+			settings: settings({ paths: [FIXTURE_PLUGIN], allowHooks: true }),
+			...loadOptions,
+		});
+		const plugin = result.plugins[0];
+		if (!plugin) throw new Error("fixture plugin did not load");
+		plugin.hooks.push(
+			{
+				plugin: plugin.name,
+				root: plugin.root,
+				event: "Stop",
+				handler: { type: "command", command: "true" },
+			},
+			{
+				plugin: plugin.name,
+				root: plugin.root,
+				event: "UserPromptSubmit",
+				handler: { type: "command", command: "true" },
+			},
+			{
+				plugin: plugin.name,
+				root: plugin.root,
+				event: "PreCompact",
+				handler: { type: "command", command: "true" },
+			},
+		);
+		const report = formatReport({
+			plugins: [plugin],
+			diagnostics: [],
+			collisions: [],
+			mcpUnavailable: [],
+			available: [],
+		});
+		expect(report).toContain("Stop additionalContext does not continue the turn");
+		expect(report).toContain("UserPromptSubmit does not see plugin commands");
+		expect(report).toContain("CLAUDE_ENV_FILE is not set");
+		expect(report).toContain("PreCompact stdout is not applied as summary instructions");
 	});
 });
 

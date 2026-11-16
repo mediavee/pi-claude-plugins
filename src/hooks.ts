@@ -217,7 +217,15 @@ export function matchesIf(
 	if (tool === "Bash" || tool === "PowerShell") {
 		const command = input.command;
 		if (typeof command !== "string") return true;
-		if (/\$\w|\$\{/.test(command) && pattern.trim().split(/\s+/).length > 1) return true;
+		const tokens = pattern
+			.trim()
+			.split(/\s+/)
+			.filter((token) => token.length > 0);
+		const withoutStar = tokens.at(-1) === "*" ? tokens.slice(0, -1) : tokens;
+		// A pattern stricter than `command *` cannot be checked inside $(...), backticks or $VAR.
+		if (withoutStar.length > 1 && /\$\(|`/.test(command)) return true;
+		// `$VAR` stays opaque for any pattern longer than one token, including `git *`.
+		if (tokens.length > 1 && /\$\w|\$\{/.test(command)) return true;
 		const test = globToRegExp(pattern, true);
 		return bashSubcommands(command).some((part) => test.test(part));
 	}
@@ -334,11 +342,15 @@ export function runHook(options: RunHookOptions): Promise<HookExecution> {
 			setTimeout(() => signalGroup("SIGKILL"), KILL_GRACE_MS).unref();
 		};
 
-		const timer = setTimeout(() => {
-			timedOut = true;
-			terminate();
-			finish(1);
-		}, timeoutFor(hook));
+		// Claude Code does not enforce timeout on a command hook with async: true.
+		const timer =
+			hook.handler.async === true
+				? undefined
+				: setTimeout(() => {
+						timedOut = true;
+						terminate();
+						finish(1);
+					}, timeoutFor(hook));
 
 		const onAbort = () => terminate();
 		options.signal?.addEventListener("abort", onAbort, { once: true });
@@ -357,7 +369,7 @@ export function runHook(options: RunHookOptions): Promise<HookExecution> {
 		function finish(exitCode: number): void {
 			if (settled) return;
 			settled = true;
-			clearTimeout(timer);
+			if (timer !== undefined) clearTimeout(timer);
 			options.signal?.removeEventListener("abort", onAbort);
 			resolvePromise({
 				hook,
@@ -418,6 +430,84 @@ export interface HookDecision {
 
 const PRECEDENCE: Record<HookOutcome, number> = { allow: 0, ask: 1, deny: 2 };
 
+/** `"block"` does what exit 2 does, except on Stop and on a hook that already ran in the background. */
+function blocksOnFailure(execution: HookExecution): boolean {
+	const handler = execution.hook.handler;
+	return handler.onFailure === "block" && handler.async !== true && execution.hook.event !== "Stop";
+}
+
+/** A `{...}` stdout that is not one JSON object. Plain text is not a failure. */
+function brokenObject(stdout: string): boolean {
+	const trimmed = stdout.trim();
+	if (!trimmed.startsWith("{") || !trimmed.endsWith("}")) return false;
+	try {
+		const parsed: unknown = JSON.parse(trimmed);
+		return typeof parsed !== "object" || parsed === null || Array.isArray(parsed);
+	} catch {
+		return true;
+	}
+}
+
+function hookFailed(execution: HookExecution): boolean {
+	if (execution.timedOut) return true;
+	if (execution.exitCode !== 0 && execution.exitCode !== 2) return true;
+	return execution.json === undefined && brokenObject(execution.stdout);
+}
+
+function onFailureReason(execution: HookExecution): string {
+	if (execution.timedOut) return 'timed out; blocking because onFailure is "block"';
+	const detail = execution.stderr.trim().split("\n")[0] ?? "";
+	return `failed; blocking because onFailure is "block"${detail ? `: ${detail}` : ""}`;
+}
+
+/**
+ * Starts every hook. Async hooks are handed to `onBackground` and are not in the returned list,
+ * so the action proceeds without their decision.
+ */
+export async function beginHookRuns<T>(
+	hooks: readonly PluginHook[],
+	start: (hook: PluginHook) => Promise<T>,
+	onBackground: (pending: Promise<T>) => void,
+): Promise<T[]> {
+	const blocking: Promise<T>[] = [];
+	for (const hook of hooks) {
+		const pending = start(hook);
+		if (hook.handler.async === true) onBackground(pending);
+		else blocking.push(pending);
+	}
+	return Promise.all(blocking);
+}
+
+/** What an async hook may still deliver: context for the model, never a decision. */
+export function asyncModelContext(execution: HookExecution): string[] {
+	const json = execution.json;
+	if (!json) return [];
+	const context: string[] = [];
+	if (json.hookSpecificOutput?.additionalContext) context.push(json.hookSpecificOutput.additionalContext);
+	if (json.systemMessage) context.push(json.systemMessage);
+	return context;
+}
+
+export interface PreCompactResult {
+	cancel: boolean;
+	reason?: string;
+	warnings: string[];
+}
+
+/**
+ * Exit 2 and `decision: "block"` cancel compaction. `continue` does not.
+ * pi 0.84.4 cannot attach hook stdout to the default summarizer, so this result
+ * never turns that stdout into a replacement summary.
+ */
+export function preCompactResult(executions: readonly HookExecution[]): PreCompactResult {
+	const decision = mergeDecisions(executions);
+	return {
+		cancel: decision.outcome === "deny",
+		...(decision.reason === undefined ? {} : { reason: decision.reason }),
+		warnings: decision.warnings,
+	};
+}
+
 /**
  * Folds a batch of executions into one decision.
  *
@@ -442,9 +532,13 @@ export function mergeDecisions(executions: readonly HookExecution[]): HookDecisi
 	};
 
 	for (const execution of executions) {
+		// An async hook already returned. Its decision, permissionDecision and continue do nothing.
+		if (execution.hook.handler.async === true) continue;
+
 		const label = `${execution.hook.plugin}:${execution.hook.event}`;
 		if (execution.timedOut) {
-			decision.warnings.push(`${label} hook timed out; no decision applied`);
+			if (blocksOnFailure(execution)) raise("deny", onFailureReason(execution));
+			else decision.warnings.push(`${label} hook timed out; no decision applied`);
 			continue;
 		}
 
@@ -452,16 +546,21 @@ export function mergeDecisions(executions: readonly HookExecution[]): HookDecisi
 		const specific = json?.hookSpecificOutput;
 
 		if (specific?.additionalContext) decision.additionalContext.push(specific.additionalContext);
-		if (json?.systemMessage) decision.warnings.push(`${label}: ${json.systemMessage}`);
+		// PreCompact discards systemMessage, the same way it discards continue.
+		if (json?.systemMessage && execution.hook.event !== "PreCompact") {
+			decision.warnings.push(`${label}: ${json.systemMessage}`);
+		}
 		if (specific?.updatedInput) decision.updatedInput = specific.updatedInput;
 		const updatedOutput = specific?.updatedToolOutput ?? specific?.updatedMCPToolOutput;
 		if (updatedOutput !== undefined) decision.updatedToolOutput = updatedOutput;
 
 		if (execution.exitCode === 2) {
 			raise("deny", execution.stderr.trim() || json?.reason || "blocked by hook");
+		} else if (blocksOnFailure(execution) && hookFailed(execution)) {
+			raise("deny", onFailureReason(execution));
 		}
 
-		if (json?.continue === false) {
+		if (json?.continue === false && execution.hook.event !== "PreCompact") {
 			decision.terminate = true;
 			decision.stopReason ??= json.stopReason ?? "a hook requested a stop";
 		}
@@ -482,7 +581,12 @@ export function mergeDecisions(executions: readonly HookExecution[]): HookDecisi
 			continue;
 		}
 
-		if (execution.exitCode !== 0 && execution.exitCode !== 2 && json === undefined) {
+		if (
+			execution.exitCode !== 0 &&
+			execution.exitCode !== 2 &&
+			json === undefined &&
+			!blocksOnFailure(execution)
+		) {
 			const detail = execution.stderr.trim().split("\n")[0] ?? "";
 			decision.warnings.push(
 				`${label} failed with non-blocking status code ${execution.exitCode}${detail ? `: ${detail}` : ""}`,

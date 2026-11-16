@@ -65,5 +65,39 @@ export function formatReport(input: ReportInput): string {
 		lines.push(`  ${diagnostic.level}: ${diagnostic.plugin}: ${diagnostic.message}`);
 	}
 
+	for (const note of loaderLimitations(input.plugins)) {
+		lines.push(`  unsupported: ${note}`);
+	}
+
 	return lines.join("\n");
+}
+
+/** Limits that a loaded plugin can hit and that the README's "Not supported" section names. */
+function loaderLimitations(plugins: readonly LoadedPlugin[]): string[] {
+	const events = new Set(plugins.flatMap((plugin) => plugin.hooks.map((hook) => hook.event)));
+	const notes: string[] = [];
+	if (events.has("Stop")) {
+		notes.push(
+			"Stop additionalContext does not continue the turn, and the continuation count does not reset when a tool is called",
+		);
+	}
+	if (events.has("UserPromptSubmit")) {
+		notes.push("UserPromptSubmit does not see plugin commands or the prompt they expand into");
+	}
+	if (events.has("SessionStart")) {
+		notes.push(
+			"CLAUDE_ENV_FILE is not set, so a SessionStart hook cannot export variables for later commands",
+		);
+	}
+	if (events.has("PreCompact")) {
+		notes.push(
+			"PreCompact stdout is not applied as summary instructions; pi 0.84.4 cannot pass them to the default summarizer",
+		);
+	}
+	if (plugins.some((plugin) => plugin.mcpServers.length > 0)) {
+		notes.push(
+			"MCP servers are registered as <plugin>__<server>, not plugin:<plugin>:<server>, and tools are not named mcp__plugin_",
+		);
+	}
+	return notes;
 }
