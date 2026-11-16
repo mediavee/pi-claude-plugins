@@ -160,16 +160,25 @@ maps onto pi's thinking level where the names coincide. Everything refused is na
 | `UserPromptSubmit` | `input` | Block the prompt, or inject context |
 | `Stop` | `agent_end` | Block to keep the conversation going, capped at 8 continuations |
 | `SessionStart` | `session_start`, `session_compact` | Inject context for the next turn, unless the same text is already in context |
-| `PreCompact` | `session_before_compact` | Block compaction |
+| `PreCompact` | `session_before_compact` | Block compaction. `continue` is ignored |
 
 Handlers receive Claude Code's JSON on stdin, with `tool_name` in Claude's vocabulary so matchers
 written upstream keep firing, and with `CLAUDE_PLUGIN_ROOT`, `CLAUDE_PLUGIN_DATA` and
-`CLAUDE_PROJECT_DIR` in their environment. Shell-form handlers run under `bash`, as upstream, so
+`CLAUDE_PROJECT_DIR` in their environment. `${CLAUDE_PLUGIN_DATA}` is one directory per plugin id,
+including `name@marketplace`, in the substituted command, the hook environment and a child agent's
+environment. Shell-form handlers run under `bash`, as upstream, so
 `bash` must be on `PATH`. Exit codes and JSON output follow the upstream
 protocol: exit `2` blocks with stderr as the reason whatever the hook also printed, valid JSON on
-stdout is honoured on any exit code, and any other non-zero exit is a non-blocking error. When
-several hooks match they all run in parallel and their decisions merge with `deny` > `ask` >
-`allow`.
+stdout is honoured on any other exit code, and any other non-zero exit is a non-blocking error
+unless the handler sets `"onFailure": "block"`. That setting makes a missing executable, an exit
+other than 0 or 2, a `{...}` stdout that is not JSON, or a timeout do what exit 2 does on that
+event. It has no effect on `Stop` or on an async handler. When several hooks match they all run
+in parallel and their decisions merge with `deny` > `ask` > `allow`.
+
+A handler with `"async": true` starts in the background and does not block the action. `decision`,
+`permissionDecision` and `continue` are ignored, and `timeout` is not enforced. `additionalContext`
+and `systemMessage` are delivered to the model on a later turn. See
+[Run hooks in the background](https://code.claude.com/docs/en/hooks#run-hooks-in-the-background).
 
 Decisions fail closed:
 
@@ -177,16 +186,18 @@ Decisions fail closed:
   there is nobody to ask, so the call is denied.
 - `permissionDecision: "defer"` is denied. It exists to suspend a `claude -p` run for later
   resumption, which pi cannot do; treating it as an allow would turn a pause into an approval.
-- `continue: false` stops the run. On `Stop` it ends the turn rather than continuing it.
+- `continue: false` stops the run, except on `PreCompact`, where it is discarded. On `Stop` it ends the turn rather than continuing it.
 
 `UserPromptSubmit` and `SessionStart` also take plain stdout as context, as upstream; on every
 other event stdout is diagnostic only.
 
 A handler's `if` rule is evaluated on `PreToolUse` and `PostToolUse`: `Bash(git *)` checks the
 command, its `$(…)` and backtick substitutions and its `&&`/`;`/`|` chain with leading `VAR=`
-assignments stripped, while `Edit(**/src/**)` checks the path. As upstream the filter is
-best-effort and runs the hook when the command is opaque. A handler that declares `if` on any
-other event never runs. `shell: "bash" | "powershell"` selects the interpreter.
+assignments stripped, while `Edit(**/src/**)` checks the path. A pattern that names more than the
+command, such as `Bash(git push *)`, runs the hook anyway when the line contains `$(…)`, backticks
+or `$VAR`. As upstream the filter is best-effort and runs the hook when the command is opaque. A
+handler that declares `if` on any other event never runs. `shell: "bash" | "powershell"` selects
+the interpreter.
 
 Matchers use Claude's rules: a matcher of only word characters, spaces, commas and pipes is a list
 of exact names, anything else is an unanchored regular expression.
@@ -205,7 +216,9 @@ hook denied, and a call that failed, are both skipped. `tool_response` carries p
 ### MCP servers
 
 Servers from `.mcp.json` are registered with `pi-mcp-adapter` at `session_start` and disposed at
-`session_shutdown`, under the name `<plugin>__<server>`. `${CLAUDE_*}` placeholders and Claude's
+`session_shutdown`, under the name `<plugin>__<server>`. That is not Claude Code's
+`plugin:<plugin>:<server>` server name or `mcp__plugin_<plugin>_<server>__<tool>` tool name; those
+names are left unchanged on purpose. `${CLAUDE_*}` placeholders and Claude's
 `${VAR}` / `${VAR:-default}` syntax are resolved across `command`, `args`, `env`, `cwd`, `url` and
 `headers` before registration.
 
@@ -238,13 +251,15 @@ you manage.
 | Hook events outside the six above | No pi counterpart; each one is named in the startup report |
 | `PostToolUseFailure` | pi has no separate failure event, so failed calls simply skip `PostToolUse` |
 | Marketplace `defaultEnabled` and `strict` | Enablement is explicit through `enabledPlugins` |
+| Stop `additionalContext`, and resetting the 8-continuation count when a tool is called | A Stop hook continues the turn only on exit 2 or `decision: "block"`. `additionalContext` is dropped. The count resets when the turn is allowed to end, not when a tool ran |
+| `UserPromptSubmit` on a plugin command | pi runs the command before `input`, then `sendUserMessage` fires `input` again with `source: "extension"`, which this loader skips. The hook sees neither the typed command nor the expanded prompt |
+| `CLAUDE_ENV_FILE` | SessionStart cannot persist `export` lines for later Bash commands. The variable is unset, so a hook that checks it does nothing |
+| Plugin MCP server names and lifecycle | Registration stays `<plugin>__<server>` through pi-mcp-adapter. Claude's `plugin:<plugin>:<server>` name, `mcp__plugin_…` tool names, eager startup and sharing the parent's connection with a subagent are not reproduced. Tool names are not renamed |
+| PreCompact stdout as summary instructions | pi 0.84.4's `session_before_compact` result accepts `cancel` or a full replacement summary. Hook stdout cannot be passed to the default summarizer without replacing the summary. `continue` is ignored and does not cancel |
 
 Everything refused or unsupported is listed at startup, never silently ignored.
 
-Four smaller deviations worth knowing:
-
-- pi dispatches `/plugin:command` before its `input` event fires, so `UserPromptSubmit` hooks do
-  not see a typed plugin command, only the prompt it expands into on the next event.
+Three smaller deviations worth knowing:
 
 - `${CLAUDE_*}` placeholders are substituted before arguments, so an argument containing one
   reaches the model literally rather than being expanded.

@@ -95,6 +95,10 @@ export interface HookHandler {
 	shell?: "bash" | "powershell";
 	/** One permission rule, such as `Bash(git *)`, narrowing when the handler runs. */
 	if?: string;
+	/** Background command hook. Decision fields are ignored and `timeout` is not enforced. */
+	async?: boolean;
+	/** `"block"` makes a startup failure, a non-0/2 exit or a timeout do what exit 2 does. */
+	onFailure?: "continue" | "block";
 }
 
 export interface HookMatcherGroup {
@@ -141,7 +145,10 @@ export interface PluginMcpServer {
 }
 
 export interface LoadedPlugin extends DiscoveredPlugin {
-	/** Whether this plugin may run hooks and `!` expansions. */
+	/**
+	 * Listed in `trustedPlugins`. That grant runs hooks and `` !`command` `` expansions.
+	 * `allowHooks` runs hooks without this grant; `allowShellCommands` runs expansions without it.
+	 */
 	trusted: boolean;
 	skills: SkillSource[];
 	commands: PluginCommand[];

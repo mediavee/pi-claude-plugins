@@ -1,5 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
+	asyncModelContext,
+	beginHookRuns,
 	discoverHooks,
 	type HookExecution,
 	hooksFor,
@@ -8,6 +10,7 @@ import {
 	mergeDecisions,
 	parseHookJson,
 	plainContext,
+	preCompactResult,
 	runHook,
 	timeoutFor,
 } from "../src/hooks.ts";
@@ -84,6 +87,15 @@ describe("matchesIf", () => {
 
 	it("errs towards running when the command is opaque", () => {
 		expect(matchesIf("Bash(git *)", "Bash", { command: "$TOOL git push" })).toBe(true);
+		expect(matchesIf("Bash(rm *)", "Bash", { command: "$EVIL" })).toBe(true);
+		expect(matchesIf("Bash(rm)", "Bash", { command: "$EVIL" })).toBe(false);
+	});
+
+	it("runs a pattern that names more than the command when the line hides a substitution", () => {
+		expect(matchesIf("Bash(git push *)", "Bash", { command: "echo $(date)" })).toBe(true);
+		expect(matchesIf("Bash(git push *)", "Bash", { command: "echo `date`" })).toBe(true);
+		expect(matchesIf("Bash(git push *)", "Bash", { command: "echo $DATE" })).toBe(true);
+		expect(matchesIf("Bash(git *)", "Bash", { command: "echo $(date)" })).toBe(false);
 	});
 
 	it("matches a file rule against the absolute path", () => {
@@ -300,6 +312,125 @@ describe("mergeDecisions", () => {
 		expect(decision.outcome).toBe("allow");
 		expect(decision.warnings.join(" ")).toContain("timed out");
 	});
+
+	it("ignores an async hook's decision fields", () => {
+		const decision = mergeDecisions([
+			execution({
+				hook: hook({
+					handler: { type: "command", command: "slow", async: true },
+				}),
+				exitCode: 2,
+				stderr: "no",
+				json: {
+					continue: false,
+					decision: "block",
+					hookSpecificOutput: { permissionDecision: "deny", additionalContext: "later" },
+				},
+			}),
+		]);
+		expect(decision.outcome).toBe("allow");
+		expect(decision.terminate).toBe(false);
+		expect(decision.additionalContext).toEqual([]);
+	});
+
+	it("treats a missing script, a non-0/2 exit and a timeout as exit 2 when onFailure is block", () => {
+		const blocking = hook({
+			handler: { type: "command", command: "guard", onFailure: "block" },
+		});
+		expect(
+			mergeDecisions([execution({ hook: blocking, exitCode: 127, stderr: "spawn ENOENT" })]).outcome,
+		).toBe("deny");
+		expect(
+			mergeDecisions([
+				execution({
+					hook: blocking,
+					exitCode: 1,
+					json: { hookSpecificOutput: { permissionDecision: "allow" } },
+				}),
+			]).outcome,
+		).toBe("deny");
+		expect(mergeDecisions([execution({ hook: blocking, timedOut: true, exitCode: 1 })]).outcome).toBe("deny");
+		expect(mergeDecisions([execution({ hook: blocking, exitCode: 0, stdout: "{not json}" })]).outcome).toBe(
+			"deny",
+		);
+	});
+
+	it("does not let onFailure block a Stop hook", () => {
+		const decision = mergeDecisions([
+			execution({
+				hook: hook({
+					event: "Stop",
+					handler: { type: "command", command: "guard", onFailure: "block" },
+				}),
+				exitCode: 1,
+				stderr: "down",
+			}),
+		]);
+		expect(decision.outcome).toBe("allow");
+	});
+
+	it("does not cancel PreCompact when the hook sets continue false", () => {
+		const decision = mergeDecisions([
+			execution({
+				hook: hook({ event: "PreCompact" }),
+				json: { continue: false, stopReason: "stop the agent", systemMessage: "ignored" },
+			}),
+		]);
+		expect(decision.outcome).toBe("allow");
+		expect(decision.terminate).toBe(false);
+		expect(decision.warnings).toEqual([]);
+	});
+
+	it("cancels PreCompact for exit 2 and not for plain stdout or continue false", () => {
+		const event = hook({ event: "PreCompact" });
+		expect(preCompactResult([execution({ hook: event, stdout: "Focus on API decisions\n" })]).cancel).toBe(
+			false,
+		);
+		expect(
+			preCompactResult([execution({ hook: event, json: { continue: false, stopReason: "stop" } })]).cancel,
+		).toBe(false);
+		const blocked = preCompactResult([execution({ hook: event, exitCode: 2, stderr: "no" })]);
+		expect(blocked.cancel).toBe(true);
+		expect(blocked.reason).toBe("no");
+	});
+
+	it("does not wait for an async hook, then keeps only its model context", async () => {
+		let release: (() => void) | undefined;
+		const gate = new Promise<void>((resolve) => {
+			release = resolve;
+		});
+		const asyncHook = hook({ handler: { type: "command", command: "slow", async: true } });
+		let background: Promise<HookExecution> | undefined;
+		const started = Date.now();
+		const executions = await beginHookRuns(
+			[asyncHook, hook()],
+			async (candidate) => {
+				if (candidate.handler.async === true) {
+					await gate;
+					return execution({
+						hook: candidate,
+						exitCode: 2,
+						stderr: "no",
+						json: {
+							decision: "block",
+							continue: false,
+							systemMessage: "tests failed",
+							hookSpecificOutput: { permissionDecision: "deny", additionalContext: "suite red" },
+						},
+					});
+				}
+				return execution({ hook: candidate });
+			},
+			(pending) => {
+				background = pending;
+			},
+		);
+		expect(Date.now() - started).toBeLessThan(200);
+		expect(mergeDecisions(executions).outcome).toBe("allow");
+		release?.();
+		const finished = await background;
+		expect(asyncModelContext(finished ?? execution())).toEqual(["suite red", "tests failed"]);
+	});
 });
 
 describe("plainContext", () => {
@@ -362,6 +493,18 @@ describe("runHook", () => {
 		expect(result.timedOut).toBe(true);
 		expect(result.json).toBeUndefined();
 		expect(Date.now() - started).toBeLessThan(5000);
+	});
+
+	it("does not enforce timeout on an async hook", async () => {
+		const result = await runHook({
+			hook: hook({
+				handler: { type: "command", command: "sleep 0.3", timeout: 0.05, async: true },
+			}),
+			input,
+			...base,
+		});
+		expect(result.timedOut).toBe(false);
+		expect(result.exitCode).toBe(0);
 	});
 
 	it("survives a missing executable", async () => {

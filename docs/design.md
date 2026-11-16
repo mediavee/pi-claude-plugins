@@ -207,7 +207,7 @@ plugin-shipped agents upstream, and we refuse them too.
 | `UserPromptSubmit` | `input` + `before_agent_start` | `{ action: "handled" }` to block; `{ message }` on the next event to inject context |
 | `Stop` | `agent_end` | `pi.sendMessage(…, { triggerTurn: true })` to keep the run going, capped at 8 |
 | `SessionStart` | `session_start`, `session_compact` (source `compact`) | inject context on the next turn |
-| `PreCompact` | `session_before_compact` | return `{ cancel: true }` |
+| `PreCompact` | `session_before_compact` | return `{ cancel: true }` for exit 2 or `decision: "block"`. `continue` does not cancel. pi 0.84.4 cannot pass hook stdout to the default summarizer |
 
 Every other Claude hook event (`PostToolUseFailure`, `Notification`, `SubagentStart`,
 `PermissionRequest`, `FileChanged`, `SessionEnd`, …) has no pi counterpart and is reported as
@@ -218,7 +218,9 @@ unsupported at load time rather than silently ignored.
 upstream. Bash patterns are matched against the command, its `$(…)` and backtick substitutions
 and its `&&`/`;`/`|` chain, with leading `VAR=` assignments stripped; a `*` in a command rule
 spans the rest of the line, while a `*` in a path rule stops at a directory boundary. The filter
-is documented as best-effort, so an unparseable rule or an opaque command runs the hook.
+is documented as best-effort, so an unparseable rule or an opaque command runs the hook. A
+pattern that names more than the command also runs the hook when the line contains `$(…)`,
+backticks or `$VAR`.
 
 **Handler types.** Only `type: "command"` is executed. `http`, `mcp_tool`, `prompt` and `agent`
 handlers are counted and reported as unsupported: `prompt`/`agent` require a hook-scoped model
@@ -256,7 +258,11 @@ match everything. This matches Claude's documented behaviour, including the cons
 - exit `0`, stdout starting `{` and ending `}` → parsed as the JSON output object.
 - exit `2` → block; the reason is the JSON blocking decision when present, otherwise stderr.
 - any other exit code → non-blocking error; the action proceeds and a warning is surfaced.
-  Valid JSON on a non-zero, non-2 exit is still honoured.
+  Valid JSON on a non-zero, non-2 exit is still honoured. `"onFailure": "block"` makes that
+  failure, a missing executable, unparseable `{...}` stdout and a timeout do what exit 2 does,
+  except on `Stop` and on `"async": true`.
+- `"async": true` does not block the action and its decision fields are ignored. `timeout` is
+  not enforced. `additionalContext` and `systemMessage` are delivered on a later turn.
 
 Honoured JSON fields: `continue` / `stopReason` (universal, blocks the action),
 top-level `decision` + `reason` (`UserPromptSubmit`, `PostToolUse`, `PreCompact`), and
@@ -277,8 +283,8 @@ printed, since it is the one outcome JSON cannot override.
 
 Handlers get `CLAUDE_PLUGIN_ROOT`, `CLAUDE_PLUGIN_DATA`, `CLAUDE_PROJECT_DIR` in their
 environment, run under `bash` with `cwd` = the session cwd, and are cancelled at `timeout`
-(default 600 s, 30 s on `UserPromptSubmit`, matching upstream). A cancelled handler renders no
-decision.
+(default 600 s, 30 s on `UserPromptSubmit`, matching upstream), except an async handler, which is
+not timed out. A cancelled handler renders no decision unless `onFailure` is `"block"`.
 
 Prior art reviewed but not copied: [`hsingjui/pi-hooks`](https://github.com/hsingjui/pi-hooks).
 

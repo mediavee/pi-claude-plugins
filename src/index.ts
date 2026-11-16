@@ -6,8 +6,10 @@ import { Type } from "typebox";
 import { resolveAgent, runAgent } from "./agents.ts";
 import { expandCommand } from "./commands.ts";
 import { resolveInventoryPath, resolveSettings, resolveStagingRoot } from "./config.ts";
-import { loadPlugins } from "./discovery.ts";
+import { loadPlugins, pluginDataDirectory, pluginDataId } from "./discovery.ts";
 import {
+	asyncModelContext,
+	beginHookRuns,
 	type HookDecision,
 	type HookEventName,
 	type HookExecution,
@@ -15,6 +17,7 @@ import {
 	hooksFor,
 	mergeDecisions,
 	plainContext,
+	preCompactResult,
 	runHook,
 } from "./hooks.ts";
 import { type McpRegistration, registerMcpServer } from "./mcp.ts";
@@ -44,6 +47,8 @@ interface State {
 	registeredCommands: Set<string>;
 	/** Calls a PreToolUse hook denied, so PostToolUse hooks skip them as they do upstream. */
 	blockedCalls: Set<string>;
+	hookAbort: AbortController;
+	hookGeneration: number;
 }
 
 function emptyState(): State {
@@ -60,6 +65,8 @@ function emptyState(): State {
 		stopContinuations: 0,
 		registeredCommands: new Set(),
 		blockedCalls: new Set(),
+		hookAbort: new AbortController(),
+		hookGeneration: 0,
 	};
 }
 
@@ -67,6 +74,7 @@ export default function claudePlugins(pi: ExtensionAPI): void {
 	const state = emptyState();
 
 	pi.on("session_start", async (event, ctx) => {
+		retireHooks(state);
 		state.registrations = [];
 		state.pendingContext = [];
 		state.stopContinuations = 0;
@@ -83,6 +91,7 @@ export default function claudePlugins(pi: ExtensionAPI): void {
 
 		const result = loadPlugins({ settings, cwd: ctx.cwd, dataRoot: state.dataRoot });
 		state.plugins = result.plugins;
+		for (const plugin of state.plugins) dataDirFor(state, plugin.id);
 		state.hooks = result.plugins.flatMap((plugin) => plugin.hooks);
 		state.agents = result.plugins.flatMap((plugin) => plugin.agents);
 		state.skillPaths = resolveSkillPaths(state, ctx, result.diagnostics);
@@ -116,6 +125,7 @@ export default function claudePlugins(pi: ExtensionAPI): void {
 	});
 
 	pi.on("session_shutdown", async () => {
+		retireHooks(state);
 		const registrations = state.registrations;
 		state.registrations = [];
 		await Promise.all(registrations.map((registration) => registration.dispose().catch(() => {})));
@@ -266,19 +276,18 @@ export default function claudePlugins(pi: ExtensionAPI): void {
 		const hooks = hooksFor(state.hooks, "PreCompact", trigger);
 		if (hooks.length === 0) return;
 
-		const decision = mergeDecisions(
+		const result = preCompactResult(
 			await runHooks(state, ctx, hooks, {
 				...baseInput(ctx, "PreCompact"),
 				trigger,
 				custom_instructions: event.customInstructions ?? null,
 			}),
 		);
-		notifyWarnings(ctx, decision);
-		if (decision.outcome === "deny" || decision.terminate) {
-			ctx.ui.notify(
-				decision.stopReason ?? decision.reason ?? "compaction blocked by a plugin hook",
-				"warning",
-			);
+		for (const warning of result.warnings) ctx.ui.notify(warning, "warning");
+		// continue is ignored. Hook stdout is not returned as a summary: this pi version
+		// would treat a compaction result as the summary itself, not as instructions for it.
+		if (result.cancel) {
+			ctx.ui.notify(result.reason ?? "compaction blocked by a plugin hook", "warning");
 			return { cancel: true };
 		}
 	});
@@ -374,8 +383,8 @@ function lastAssistantText(messages: readonly unknown[]): string {
 }
 
 /** `${CLAUDE_PLUGIN_DATA}` is created on first reference upstream, so hooks can rely on it. */
-function dataDirFor(state: State, plugin: string): string {
-	const dir = resolve(state.dataRoot, plugin.replace(/[^\w-]+/g, "-"));
+function dataDirFor(state: State, pluginKey: string): string {
+	const dir = pluginDataDirectory(state.dataRoot, pluginDataId(state.plugins, pluginKey));
 	try {
 		mkdirSync(dir, { recursive: true });
 	} catch {
@@ -384,23 +393,43 @@ function dataDirFor(state: State, plugin: string): string {
 	return dir;
 }
 
+function retireHooks(state: State): void {
+	state.hookGeneration += 1;
+	state.hookAbort.abort();
+	state.hookAbort = new AbortController();
+}
+
+function hookSignal(state: State, ctx: ExtensionContext): AbortSignal | undefined {
+	if (ctx.signal === undefined) return state.hookAbort.signal;
+	return AbortSignal.any([state.hookAbort.signal, ctx.signal]);
+}
+
 function runHooks(
 	state: State,
 	ctx: ExtensionContext,
 	hooks: readonly PluginHook[],
 	input: HookInput,
 ): Promise<HookExecution[]> {
-	return Promise.all(
-		hooks.map((hook) =>
+	const generation = state.hookGeneration;
+	const signal = hookSignal(state, ctx);
+	return beginHookRuns(
+		hooks,
+		(hook) =>
 			runHook({
 				hook,
 				input,
 				cwd: ctx.cwd,
 				projectDir: ctx.cwd,
 				dataDir: dataDirFor(state, hook.plugin),
-				...(ctx.signal ? { signal: ctx.signal } : {}),
+				...(signal ? { signal } : {}),
 			}),
-		),
+		(pending) => {
+			void pending.then((execution) => {
+				if (generation !== state.hookGeneration) return;
+				const context = asyncModelContext(execution);
+				if (context.length > 0) state.pendingContext.push(...context);
+			});
+		},
 	);
 }
 
